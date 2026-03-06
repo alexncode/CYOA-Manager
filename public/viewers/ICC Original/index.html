@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang=en>
+
+<head>
+    <meta charset=utf-8>
+    <meta http-equiv=X-UA-Compatible content="IE=edge">
+    <meta name=viewport content="width=device-width,initial-scale=1">
+    <link rel=icon href=/favicon.ico>
+    <link rel=stylesheet href=https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css
+        integrity=sha384-Gn5384xqQ1aoWXA+058RXPxPg6fy4IWvTNh0E263XmFcJlSAwiGgFAW/dAiS6JXm crossorigin=anonymous>
+    <script src=https://unpkg.com/vue-select@latest></script>
+    <link rel=stylesheet href=https://unpkg.com/vue-select@latest/dist/vue-select.css crossorigin=anonymous>
+    <title>CYOA</title>
+    <link rel=stylesheet href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900" crossorigin=anonymous>
+    <link rel=stylesheet href=https://cdn.jsdelivr.net/npm/@mdi/font@latest/css/materialdesignicons.min.css crossorigin=anonymous>
+    <link href=css/app.df7ca14c.css rel=preload as=style>
+    <link href=css/chunk-vendors.58637379.css rel=preload as=style>
+    <link href=js/app.c533aa25.js rel=preload as=script>
+    <link href=js/chunk-vendors.59af3576.js rel=preload as=script>
+    <link href=css/chunk-vendors.58637379.css rel=stylesheet>
+    <link href=css/app.df7ca14c.css rel=stylesheet>
+    <style>
+        body {
+            background-color: #23374D;
+            font-family: sans-serif;
+            color: #EEE;
+        }
+
+        .containerl {
+            position: fixed;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+
+        /* .loading {
+            width: 200px;
+            position: relative;
+            text-align: center;
+        }
+
+        .loading::before {
+            content: 'Loading';
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 4px;
+            padding-left: 4px;
+        }
+
+        .loading::after {
+            content: ' ';
+            display: block;
+            height: 2px;
+            background-color: #1089FF;
+            position: absolute;
+            top: 50%;
+            left: 0;
+            transform: translateY(-1px);
+            animation-name: load;
+            animation-duration: 1s;
+            animation-direction: normal;
+            animation-timing-function: ease-in-out;
+            animation-iteration-count: infinite;
+        } */
+
+        .progressBar {
+            width: 200px;
+            height: 10px;
+            background-color: #333;
+            position: relative;
+            margin-top: 10px;
+        }
+
+        @media (min-width: 600px) {
+            .progressBar {
+                width: 500px;
+            }
+        }
+
+        .progressPercent {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        #app {
+            display: none;
+        }
+
+        .nopadding > span > span {
+            --mask: radial-gradient(20px at 20px 20px,#0000 98%,#000) -20px -20px;
+            -webkit-mask: var(--mask);
+            mask: var(--mask);
+        }
+        /* @keyframes load {
+            0% {
+                width: 0;
+            }
+
+            50% {
+                width: 100%;
+                margin-left: 0;
+            }
+
+            100% {
+                width: 0;
+                margin-left: 100%;
+            }
+        } */
+    </style>
+</head>
+
+<body><noscript><strong>We're sorry but the CYOA doesn't work properly without JavaScript enabled.
+            Please enable it to continue.</strong></noscript>
+    <div id=app></div>
+    <div class="containerl">
+        <!-- <div class="loading"></div> -->
+        <div class="title">LOADING</div>
+        <div class="progressBar">
+            <div class="progress" style="width: 0%; height: 100%; background-color: #1089FF;">
+                <div class="progressPercent"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function () {
+            // Get a reference to the loading bar element
+            const loadingBar = document.getElementsByClassName("containerl")[0];
+            const app = document.getElementById("app");
+            const interval = setInterval(function () {
+
+                const colElement = document.querySelector("div.col");
+                if (colElement) {
+                    clearInterval(interval);
+                    loadingBar.style.display = "none";
+                    app.style.display = "block"
+                }
+            }, 50); // Adjust the interval for a smoother or faster animation
+        });
+
+        
+        let _XHR = XMLHttpRequest;
+        XMLHttpRequest = class XHR extends _XHR {
+            constructor() {
+                super();
+                this.addEventListener('progress', e=>{
+                    const total = e.total ? e.total : ( parseInt(e.target.getResponseHeader('x-decompressed-content-length'), 10) || parseInt(e.target.getResponseHeader('Content-Length'), 10));
+                    document.querySelector(".progress").style.width = (`${(100 * e.loaded / total).toFixed(2)}%`)
+                    document.querySelector(".progressPercent").innerText = (`${(100 * e.loaded / total).toFixed(2)}%`)
+                });
+                this.addEventListener('load', e=>{
+						console.log(e.loaded)
+					});
+
+            }
+        }
+    </script>
+    <script src=js/html-to-image.min.js></script>
+    <script src=js/chunk-vendors.59af3576.js></script>
+    <script src=js/app.c533aa25.js></script>
+</body>
+
+</html>
