@@ -32,4 +32,4 @@ release/
 *.njsproj
 *.sln
 *.sw?
-/cyoas
+cyoas/
