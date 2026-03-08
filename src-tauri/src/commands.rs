@@ -196,7 +196,7 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
         },
     );
 
-    let mut parsed = tauri::Url::parse(url.trim()).map_err(|e| format!("Invalid URL: {}", e))?;
+    let parsed = tauri::Url::parse(url.trim()).map_err(|e| format!("Invalid URL: {}", e))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("Only http:// and https:// URLs are supported".to_string());
     }
@@ -219,23 +219,14 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
         );
     }
 
-    parsed = resolve_project_json_url(parsed)?;
+    let (bytes, base_url) = download_project_data(parsed)?;
 
-    let response = reqwest::blocking::get(parsed.clone())
-        .map_err(|e| format!("Download failed: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {}", e))?;
-
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-
-    let processed = inline_downloaded_project_images(bytes.as_ref(), &parsed, app, task_id)?;
+    let processed = inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?;
 
     let dir = cyoas_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cyoas folder: {}", e))?;
 
-    let destination = unique_path(dir.join(download_file_name(&parsed)));
+    let destination = unique_path(dir.join(download_file_name(&base_url)));
     std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
 
     let library = app.state::<LibraryState>();
@@ -376,12 +367,10 @@ fn import_project_from_catalog_website(
         );
     }
 
-    let mut parsed = tauri::Url::parse(trimmed_url).map_err(|e| format!("Invalid URL: {}", e))?;
+    let parsed = tauri::Url::parse(trimmed_url).map_err(|e| format!("Invalid URL: {}", e))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("Only http:// and https:// URLs are supported".to_string());
     }
-
-    parsed = resolve_project_json_url(parsed)?;
 
     if let Some((app, task_id)) = progress {
         emit_catalog_import_progress(
@@ -399,14 +388,7 @@ fn import_project_from_catalog_website(
         );
     }
 
-    let response = reqwest::blocking::get(parsed.clone())
-        .map_err(|e| format!("Download failed: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {}", e))?;
-
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    let (bytes, base_url) = download_project_data(parsed)?;
 
     if let Some((app, task_id)) = progress {
         emit_catalog_import_progress(
@@ -425,9 +407,9 @@ fn import_project_from_catalog_website(
     }
 
     let processed = if let Some((app, task_id)) = progress {
-        inline_downloaded_project_images(bytes.as_ref(), &parsed, app, task_id)?
+        inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?
     } else {
-        inline_downloaded_project_images_silent(bytes.as_ref(), &parsed)?
+        inline_downloaded_project_images_silent(bytes.as_ref(), &base_url)?
     };
 
     let dir = cyoas_dir();
@@ -449,10 +431,130 @@ fn import_project_from_catalog_website(
         );
     }
 
-    let destination = unique_path(dir.join(download_file_name(&parsed)));
+    let destination = unique_path(dir.join(download_file_name(&base_url)));
     std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
 
     add_project_from_path(destination.to_string_lossy().to_string(), state)
+}
+
+fn download_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+    if is_cyoa_cafe_host(url.host_str()) {
+        return download_cyoa_cafe_project_data(url);
+    }
+
+    if is_direct_project_json_url(&url) {
+        return download_project_json_bytes(url);
+    }
+
+    let default_project_url = build_default_project_json_url(&url);
+    if let Ok(project) = download_project_json_bytes(default_project_url) {
+        return Ok(project);
+    }
+
+    let (html, final_page_url) = fetch_html_page(url, "Failed to open website")?;
+
+    if let Some(project_url) = find_project_json_url_in_html(&html, &final_page_url) {
+        if let Ok(project) = download_project_json_bytes(project_url) {
+            return Ok(project);
+        }
+    }
+
+    if let Some((json, base_url)) = find_embedded_project_data(&html, &final_page_url)? {
+        let bytes = serde_json::to_vec(&json)
+            .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
+        return Ok((bytes, base_url));
+    }
+
+    Err("Could not find project.json or embedded project data on the provided page".to_string())
+}
+
+fn download_cyoa_cafe_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+    if let Some(game_id) = extract_cyoa_cafe_game_id(&url) {
+        if let Some(source_url) = fetch_cyoa_cafe_game_source_url(&game_id)? {
+            let parsed_source = tauri::Url::parse(source_url.trim())
+                .map_err(|e| format!("Invalid source URL from cyoa.cafe: {}", e))?;
+            return download_project_data(parsed_source);
+        }
+    }
+
+    let (html, final_url) = fetch_html_page(url, "Failed to open cyoa.cafe page")?;
+    if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
+        if let Ok(project) = download_project_json_bytes(project_url) {
+            return Ok(project);
+        }
+    }
+
+    if let Some((json, base_url)) = find_embedded_project_data(&html, &final_url)? {
+        let bytes = serde_json::to_vec(&json)
+            .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
+        return Ok((bytes, base_url));
+    }
+
+    Err("Could not find a project.json link or embedded project data on the provided cyoa.cafe page".to_string())
+}
+
+fn download_project_json_bytes(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+    let response = reqwest::blocking::get(url.clone())
+        .map_err(|e| format!("Download failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    let final_url = tauri::Url::parse(response.url().as_str())
+        .map_err(|e| format!("Failed to parse downloaded URL: {}", e))?;
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+
+    serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
+        .map_err(|e| format!("Downloaded file was not valid JSON: {}", e))?;
+
+    Ok((bytes.to_vec(), final_url))
+}
+
+fn fetch_html_page(url: tauri::Url, error_prefix: &str) -> Result<(String, tauri::Url), String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|e| format!("{}: {}", error_prefix, e))?
+        .error_for_status()
+        .map_err(|e| format!("{}: {}", error_prefix, e))?;
+    let final_url = tauri::Url::parse(response.url().as_str())
+        .map_err(|e| format!("Failed to parse page URL: {}", e))?;
+    let html = response
+        .text()
+        .map_err(|e| format!("Failed to read page HTML: {}", e))?;
+
+    Ok((html, final_url))
+}
+
+fn find_embedded_project_data(
+    html: &str,
+    page_url: &tauri::Url,
+) -> Result<Option<(serde_json::Value, tauri::Url)>, String> {
+    for script in extract_inline_script_blocks(html) {
+        if let Some(project) = extract_embedded_project_json(script) {
+            return Ok(Some((project, build_default_project_json_url(page_url))));
+        }
+    }
+
+    for script_url in find_script_urls_in_html(html, page_url) {
+        let response = match reqwest::blocking::get(script_url.clone()) {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let script = match response.text() {
+            Ok(script) => script,
+            Err(_) => continue,
+        };
+
+        if let Some(project) = extract_embedded_project_json(&script) {
+            return Ok(Some((project, build_default_project_json_url(page_url))));
+        }
+    }
+
+    Ok(None)
 }
 
 fn apply_catalog_project_name_override(
@@ -666,44 +768,30 @@ fn score_project_json_candidate(path: &Path, json: &serde_json::Value) -> i32 {
     score
 }
 
-fn resolve_project_json_url(mut url: tauri::Url) -> Result<tauri::Url, String> {
-    if is_direct_project_json_url(&url) {
-        return Ok(url);
-    }
+fn build_default_project_json_url(url: &tauri::Url) -> tauri::Url {
+    let mut project_url = url.clone();
+    project_url.set_query(None);
+    project_url.set_fragment(None);
 
-    if is_cyoa_cafe_host(url.host_str()) {
-        if let Some(game_id) = extract_cyoa_cafe_game_id(&url) {
-            if let Some(source_url) = fetch_cyoa_cafe_game_source_url(&game_id)? {
-                let parsed_source = tauri::Url::parse(source_url.trim())
-                    .map_err(|e| format!("Invalid source URL from cyoa.cafe: {}", e))?;
-                return resolve_project_json_url(parsed_source);
-            }
-        }
-
-        let response = reqwest::blocking::get(url.clone())
-            .map_err(|e| format!("Failed to open cyoa.cafe page: {}", e))?
-            .error_for_status()
-            .map_err(|e| format!("Failed to open cyoa.cafe page: {}", e))?;
-        let final_url = tauri::Url::parse(response.url().as_str())
-            .map_err(|e| format!("Failed to parse cyoa.cafe URL: {}", e))?;
-        let html = response
-            .text()
-            .map_err(|e| format!("Failed to read cyoa.cafe page: {}", e))?;
-        if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
-            return Ok(project_url);
-        }
-
-        return Err("Could not find a project.json link on the provided cyoa.cafe page".to_string());
-    }
-
-    let mut path = url.path().trim_end_matches('/').to_string();
-    if path.is_empty() {
-        path = "/project.json".to_string();
+    let path = project_url.path();
+    let new_path = if path.is_empty() || path == "/" {
+        "/project.json".to_string()
+    } else if path.ends_with('/') {
+        format!("{}project.json", path)
     } else {
-        path.push_str("/project.json");
-    }
-    url.set_path(&path);
-    Ok(url)
+        let last_segment = path.rsplit('/').next().unwrap_or_default();
+        if last_segment.contains('.') {
+            match path.rsplit_once('/') {
+                Some((prefix, _)) if !prefix.is_empty() => format!("{}/project.json", prefix),
+                _ => "/project.json".to_string(),
+            }
+        } else {
+            format!("{}/project.json", path)
+        }
+    };
+
+    project_url.set_path(&new_path);
+    project_url
 }
 
 fn is_cyoa_cafe_host(host: Option<&str>) -> bool {
@@ -786,6 +874,198 @@ fn find_project_json_url_in_html(html: &str, page_url: &tauri::Url) -> Option<ta
     }
 
     None
+}
+
+fn find_script_urls_in_html(html: &str, page_url: &tauri::Url) -> Vec<tauri::Url> {
+    let lower_html = html.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    while let Some(found_at) = lower_html[cursor..].find("<script") {
+        let tag_start = cursor + found_at;
+        let Some(tag_end_relative) = html[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_relative + 1;
+        let tag = &html[tag_start..tag_end];
+
+        if let Some(src) = extract_html_attribute(tag, "src") {
+            if let Ok(url) = page_url.join(src.trim()) {
+                let key = url.as_str().to_ascii_lowercase();
+                if seen.insert(key) {
+                    urls.push(url);
+                }
+            }
+        }
+
+        cursor = tag_end;
+    }
+
+    urls.sort_by_key(script_url_priority);
+    urls
+}
+
+fn script_url_priority(url: &tauri::Url) -> i32 {
+    let path = url.path().to_ascii_lowercase();
+    let mut score = 0;
+
+    if path.contains("app") || path.contains("main") {
+        score -= 20;
+    }
+    if path.contains("vendor") || path.contains("chunk") || path.contains("polyfill") {
+        score += 20;
+    }
+
+    score
+}
+
+fn extract_inline_script_blocks(html: &str) -> Vec<&str> {
+    let lower_html = html.to_ascii_lowercase();
+    let mut scripts = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(found_at) = lower_html[cursor..].find("<script") {
+        let tag_start = cursor + found_at;
+        let Some(tag_end_relative) = html[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_relative + 1;
+        let tag = &html[tag_start..tag_end];
+
+        if extract_html_attribute(tag, "src").is_none() {
+            if let Some(close_relative) = lower_html[tag_end..].find("</script>") {
+                let close_start = tag_end + close_relative;
+                scripts.push(&html[tag_end..close_start]);
+                cursor = close_start + "</script>".len();
+                continue;
+            }
+        }
+
+        cursor = tag_end;
+    }
+
+    scripts
+}
+
+fn extract_html_attribute(tag: &str, attribute: &str) -> Option<String> {
+    let lower_tag = tag.to_ascii_lowercase();
+    let needle = format!("{}=", attribute.to_ascii_lowercase());
+    let start = lower_tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let trimmed = rest.trim_start();
+
+    if let Some(value) = trimmed.strip_prefix('"') {
+        return value.split('"').next().map(|part| part.to_string());
+    }
+    if let Some(value) = trimmed.strip_prefix('\'') {
+        return value.split('\'').next().map(|part| part.to_string());
+    }
+
+    let end = trimmed
+        .find(|c: char| c.is_ascii_whitespace() || c == '>')
+        .unwrap_or(trimmed.len());
+    Some(trimmed[..end].to_string())
+}
+
+fn extract_embedded_project_json(script: &str) -> Option<serde_json::Value> {
+    let mut best_match: Option<(i32, serde_json::Value)> = None;
+
+    for marker in ["\"rows\":[", "\"rows\": [", "\"styling\":{", "\"styling\": {"] {
+        let mut search_offset = 0;
+
+        while let Some(found_at) = script[search_offset..].find(marker) {
+            let marker_index = search_offset + found_at;
+            let mut backtrack_end = marker_index;
+            let mut attempts = 0;
+
+            while attempts < 256 {
+                let Some(open_index) = script[..backtrack_end].rfind('{') else {
+                    break;
+                };
+
+                if let Some(close_index) = find_balanced_json_object_end(script, open_index) {
+                    if close_index > marker_index {
+                        let candidate = &script[open_index..=close_index];
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(candidate) {
+                            let score = score_embedded_project_candidate(&json);
+                            if score > 0 {
+                                match &best_match {
+                                    Some((best_score, _)) if *best_score >= score => {}
+                                    _ => best_match = Some((score, json)),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                backtrack_end = open_index;
+                attempts += 1;
+            }
+
+            search_offset = marker_index + marker.len();
+        }
+    }
+
+    best_match.map(|(_, json)| json)
+}
+
+fn find_balanced_json_object_end(source: &str, start_index: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (offset, ch) in source[start_index..].char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start_index + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn score_embedded_project_candidate(json: &serde_json::Value) -> i32 {
+    let mut score = 0;
+
+    if json.get("rows").and_then(|value| value.as_array()).is_some() {
+        score += 60;
+    }
+    if json.get("styling").map(|value| value.is_object()).unwrap_or(false) {
+        score += 35;
+    }
+    if json.get("version").and_then(|value| value.as_str()).is_some() {
+        score += 20;
+    }
+    if extract_project_name(json).is_some() {
+        score += 15;
+    }
+    if extract_first_row_title(json).is_some() {
+        score += 10;
+    }
+
+    score
 }
 
 fn extract_url_token_around(html: &str, center: usize, needle_len: usize) -> Option<String> {
