@@ -700,7 +700,7 @@ fn extract_first_row_title(json: &serde_json::Value) -> Option<String> {
 
 /// Returns the directory containing viewer sub-folders.
 /// Dev:  `<workspace>/public/viewers`
-/// Prod: `<exe_dir>/viewers` or `<exe_dir>/resources/viewers`
+/// Prod: probes portable and bundled resource layouts (Windows/Linux/macOS).
 pub fn viewers_base_dir() -> std::path::PathBuf {
     #[cfg(debug_assertions)]
     {
@@ -716,17 +716,43 @@ pub fn viewers_base_dir() -> std::path::PathBuf {
     {
         let exe = std::env::current_exe().expect("cannot resolve exe path");
         let exe_dir = exe.parent().expect("exe has no parent");
-        let portable_dir = exe_dir.join("viewers");
-        if portable_dir.exists() {
-            return portable_dir;
+
+        // Probe common packaging layouts across platforms.
+        let mut candidates = vec![
+            exe_dir.join("viewers"),
+            exe_dir.join("_up_").join("public").join("viewers"),
+            exe_dir.join("resources").join("viewers"),
+            exe_dir.join("resources").join("public").join("viewers"),
+            exe_dir
+                .join("resources")
+                .join("_up_")
+                .join("public")
+                .join("viewers"),
+        ];
+
+        if let Some(contents_dir) = exe_dir.parent() {
+            candidates.push(contents_dir.join("Resources").join("viewers"));
+            candidates.push(contents_dir.join("Resources").join("resources").join("viewers"));
+            candidates.push(contents_dir.join("Resources").join("public").join("viewers"));
+            candidates.push(
+                contents_dir
+                    .join("Resources")
+                    .join("_up_")
+                    .join("public")
+                    .join("viewers"),
+            );
         }
 
-        let bundled_dir = exe_dir.join("resources").join("viewers");
-        if bundled_dir.exists() {
-            return bundled_dir;
+        for candidate in &candidates {
+            if candidate.exists() {
+                return candidate.clone();
+            }
         }
 
-        portable_dir
+        candidates
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| exe_dir.join("viewers"))
     }
 }
 
