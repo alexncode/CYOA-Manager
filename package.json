@@ -8,6 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "release:macos": "pnpm tauri build --bundles app,dmg",
     "release:installers": "pnpm tauri build --bundles nsis,msi",
     "release:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
     "release:all": "pnpm tauri build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -SkipBuild"
