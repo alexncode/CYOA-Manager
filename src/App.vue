@@ -1,17 +1,44 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { computed, onMounted } from "vue";
 import { RouterView, RouterLink } from "vue-router";
 import { useSettings } from "./composables/useSettings";
 import { useLibrary } from "./composables/useLibrary";
 
-const { applyTheme } = useSettings();
-const { loadViewers } = useLibrary();
+const { settings, applyTheme } = useSettings();
+const { projects, viewers, loadLibrary, loadViewers, openViewer } = useLibrary();
+
+const randomCandidates = computed(() =>
+  projects.value.filter((project) => !project.file_missing)
+);
+
+const canOpenRandom = computed(
+  () => randomCandidates.value.length > 0 && viewers.value.length > 0
+);
 
 onMounted(async () => {
   applyTheme();
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  await loadLibrary();
   await loadViewers();
 });
+
+async function openRandomProject() {
+  if (!canOpenRandom.value) {
+    return;
+  }
+
+  const candidates = randomCandidates.value;
+  const project = candidates[Math.floor(Math.random() * candidates.length)];
+  const viewerId = project.viewer_preference
+    || settings.value.defaultViewer
+    || viewers.value[0]?.id;
+
+  if (!viewerId) {
+    return;
+  }
+
+  await openViewer(project, viewerId);
+}
 </script>
 
 <template>
@@ -24,6 +51,12 @@ onMounted(async () => {
       <RouterLink to="/settings" class="nav-link" active-class="active">
         ⚙️ Settings
       </RouterLink>
+      <RouterLink to="/catalog" class="nav-link" active-class="active">
+        🌐 Infaera Catalog
+      </RouterLink>
+      <button class="nav-link nav-button" :disabled="!canOpenRandom" @click="openRandomProject">
+        🎲 Random
+      </button>
       <a
         class="nav-link sidebar-external patreon-link"
         href="https://www.patreon.com/interactiveapps"
@@ -57,9 +90,6 @@ onMounted(async () => {
   --tag-bg: rgba(91, 138, 240, 0.18);
   --tag-color: #8bb0ff;
   --cover-placeholder: #2a2d36;
-}
-:root.dark {
-  /* same as default above */
 }
 :root:not(.dark) {
   --bg: #f3f4f8;
@@ -180,6 +210,21 @@ body {
   background: var(--hover);
   color: var(--accent);
   font-weight: 600;
+}
+.nav-button {
+  width: 100%;
+  background: none;
+  border: none;
+  text-align: left;
+  font: inherit;
+}
+.nav-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.nav-button:disabled:hover {
+  background: transparent;
+  color: var(--muted);
 }
 .sidebar-external {
   margin-top: auto;

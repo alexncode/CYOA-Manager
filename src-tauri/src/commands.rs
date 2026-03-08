@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -23,6 +24,19 @@ struct DownloadProjectProgress {
     total: usize,
     image_current: usize,
     image_total: usize,
+    message: String,
+    done: bool,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogImportProgress {
+    task_id: String,
+    phase: String,
+    current: usize,
+    total: usize,
     message: String,
     done: bool,
     success: bool,
@@ -80,6 +94,89 @@ pub fn start_download_project(app: tauri::AppHandle, url: String) -> Result<Stri
     });
 
     Ok(task_id)
+}
+
+#[tauri::command]
+pub fn download_catalog_entry(
+    website_url: String,
+    zip_url: String,
+    project_name: String,
+    state: State<LibraryState>,
+) -> Result<Project, String> {
+    let desired_name = project_name.trim();
+
+    let mut project = match import_project_from_catalog_website(
+        None,
+        website_url.trim(),
+        desired_name,
+        &state,
+    ) {
+        Ok(project) => project,
+        Err(_) => {
+            let extracted_project = download_catalog_project_zip(zip_url.trim(), desired_name, None)?;
+            add_project_from_path(extracted_project.to_string_lossy().to_string(), &state)?
+        }
+    };
+
+    apply_catalog_project_name_override(&mut project, desired_name, &state)?;
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn start_download_catalog_entry(
+    app: tauri::AppHandle,
+    task_id: String,
+    website_url: String,
+    zip_url: String,
+    project_name: String,
+) -> Result<String, String> {
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Err("Missing task id".to_string());
+    }
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+
+    thread::spawn(move || {
+        if let Err(error) = run_download_catalog_entry(
+            &app_handle,
+            &task_id_for_thread,
+            website_url,
+            zip_url,
+            project_name,
+        ) {
+            emit_catalog_import_progress(
+                app_handle,
+                CatalogImportProgress {
+                    task_id: task_id_for_thread,
+                    phase: "error".to_string(),
+                    current: 100,
+                    total: 100,
+                    message: "Catalog import failed".to_string(),
+                    done: true,
+                    success: false,
+                    error: Some(error),
+                },
+            );
+        }
+    });
+
+    Ok(task_id)
+}
+
+#[tauri::command]
+pub fn fetch_catalog_source(url: String) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("Missing catalog URL".to_string());
+    }
+
+    reqwest::blocking::get(trimmed)
+        .map_err(|e| format!("Download failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Download failed: {}", e))?
+        .text()
+        .map_err(|e| format!("Failed to read catalog source: {}", e))
 }
 
 fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> Result<(), String> {
@@ -161,6 +258,412 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
     );
 
     Ok(())
+}
+
+fn run_download_catalog_entry(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    website_url: String,
+    zip_url: String,
+    project_name: String,
+) -> Result<(), String> {
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "trying-website".to_string(),
+            current: 0,
+            total: 100,
+            message: format!("Trying website link for {}", project_name.trim()),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let library = app.state::<LibraryState>();
+    let desired_name = project_name.trim();
+
+    let mut project = match import_project_from_catalog_website(
+        Some((app, task_id)),
+        website_url.trim(),
+        desired_name,
+        &library,
+    ) {
+        Ok(project) => project,
+        Err(error) => {
+            emit_catalog_import_progress(
+                app.clone(),
+                CatalogImportProgress {
+                    task_id: task_id.to_string(),
+                    phase: "fallback-archive".to_string(),
+                    current: 20,
+                    total: 100,
+                    message: format!("Website link failed, falling back to ZIP: {}", error),
+                    done: false,
+                    success: false,
+                    error: None,
+                },
+            );
+
+            let extracted_project = download_catalog_project_zip(
+                zip_url.trim(),
+                desired_name,
+                Some((app, task_id)),
+            )?;
+
+            emit_catalog_import_progress(
+                app.clone(),
+                CatalogImportProgress {
+                    task_id: task_id.to_string(),
+                    phase: "importing-project".to_string(),
+                    current: 90,
+                    total: 100,
+                    message: format!("Adding {} to the library", desired_name),
+                    done: false,
+                    success: false,
+                    error: None,
+                },
+            );
+
+            add_project_from_path(extracted_project.to_string_lossy().to_string(), &library)?
+        }
+    };
+
+    apply_catalog_project_name_override(&mut project, desired_name, &library)?;
+
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "done".to_string(),
+            current: 100,
+            total: 100,
+            message: format!("Imported {}", project.name),
+            done: true,
+            success: true,
+            error: None,
+        },
+    );
+
+    Ok(())
+}
+
+fn import_project_from_catalog_website(
+    progress: Option<(&tauri::AppHandle, &str)>,
+    website_url: &str,
+    project_name: &str,
+    state: &State<LibraryState>,
+) -> Result<Project, String> {
+    let trimmed_url = website_url.trim();
+    if trimmed_url.is_empty() {
+        return Err("Missing website URL".to_string());
+    }
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "resolving-website".to_string(),
+                current: 5,
+                total: 100,
+                message: format!("Resolving website link for {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let mut parsed = tauri::Url::parse(trimmed_url).map_err(|e| format!("Invalid URL: {}", e))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only http:// and https:// URLs are supported".to_string());
+    }
+
+    parsed = resolve_project_json_url(parsed)?;
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "downloading-project".to_string(),
+                current: 20,
+                total: 100,
+                message: format!("Downloading project data for {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let response = reqwest::blocking::get(parsed.clone())
+        .map_err(|e| format!("Download failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "processing-project".to_string(),
+                current: 55,
+                total: 100,
+                message: format!("Processing linked images for {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let processed = if let Some((app, task_id)) = progress {
+        inline_downloaded_project_images(bytes.as_ref(), &parsed, app, task_id)?
+    } else {
+        inline_downloaded_project_images_silent(bytes.as_ref(), &parsed)?
+    };
+
+    let dir = cyoas_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cyoas folder: {}", e))?;
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "saving-project".to_string(),
+                current: 85,
+                total: 100,
+                message: format!("Saving {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let destination = unique_path(dir.join(download_file_name(&parsed)));
+    std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
+
+    add_project_from_path(destination.to_string_lossy().to_string(), state)
+}
+
+fn apply_catalog_project_name_override(
+    project: &mut Project,
+    desired_name: &str,
+    state: &State<LibraryState>,
+) -> Result<(), String> {
+    if project.name == desired_name || desired_name.is_empty() {
+        return Ok(());
+    }
+
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let stored = lib
+        .projects
+        .iter_mut()
+        .find(|candidate| candidate.id == project.id)
+        .ok_or_else(|| format!("Project not found after import: {}", project.id))?;
+    stored.name = desired_name.to_string();
+    project.name = stored.name.clone();
+    save_library(&lib)?;
+    Ok(())
+}
+
+fn download_catalog_project_zip(
+    zip_url: &str,
+    project_name: &str,
+    progress: Option<(&tauri::AppHandle, &str)>,
+) -> Result<PathBuf, String> {
+    if zip_url.is_empty() {
+        return Err("Missing ZIP URL".to_string());
+    }
+
+    let response = reqwest::blocking::get(zip_url)
+        .map_err(|e| format!("Download failed: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Download failed: {}", e))?;
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("Failed to read ZIP archive: {}", e))?;
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "extracting-archive".to_string(),
+                current: 25,
+                total: 100,
+                message: format!("Extracting {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let archive_name = if slugify(project_name).is_empty() {
+        "downloaded-cyoa".to_string()
+    } else {
+        slugify(project_name)
+    };
+
+    let extraction_root = unique_dir_path(cyoas_dir().join(&archive_name));
+    std::fs::create_dir_all(&extraction_root)
+        .map_err(|e| format!("Failed to create extraction folder: {}", e))?;
+
+    if let Err(error) = extract_catalog_zip(&bytes, &extraction_root, progress) {
+        let _ = std::fs::remove_dir_all(&extraction_root);
+        return Err(error);
+    }
+
+    if let Some((app, task_id)) = progress {
+        emit_catalog_import_progress(
+            app.clone(),
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "scanning-archive".to_string(),
+                current: 75,
+                total: 100,
+                message: format!("Finding project JSON for {}", project_name),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    let Some(project_path) = find_best_project_json_path(&extraction_root) else {
+        let _ = std::fs::remove_dir_all(&extraction_root);
+        return Err("No usable project JSON file was found in the ZIP archive".to_string());
+    };
+
+    Ok(project_path)
+}
+
+fn extract_catalog_zip(
+    bytes: &[u8],
+    destination: &Path,
+    progress: Option<(&tauri::AppHandle, &str)>,
+) -> Result<(), String> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| format!("Downloaded file is not a valid ZIP archive: {}", e))?;
+    let total_entries = archive.len().max(1);
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("Failed to read ZIP entry: {}", e))?;
+        let Some(relative_path) = entry.enclosed_name().map(|path| path.to_path_buf()) else {
+            continue;
+        };
+
+        let output_path = destination.join(relative_path);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output_path)
+                .map_err(|e| format!("Failed to create extracted folder: {}", e))?;
+        } else {
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create extracted folder: {}", e))?;
+            }
+
+            let mut file = std::fs::File::create(&output_path)
+                .map_err(|e| format!("Failed to create extracted file: {}", e))?;
+            std::io::copy(&mut entry, &mut file)
+                .map_err(|e| format!("Failed to extract ZIP entry: {}", e))?;
+            file.flush()
+                .map_err(|e| format!("Failed to finalize extracted file: {}", e))?;
+        }
+
+        if let Some((app, task_id)) = progress {
+            let percent = 25 + ((index + 1) * 50 / total_entries);
+            emit_catalog_import_progress(
+                app.clone(),
+                CatalogImportProgress {
+                    task_id: task_id.to_string(),
+                    phase: "extracting-archive".to_string(),
+                    current: percent,
+                    total: 100,
+                    message: format!("Extracting archive files {}/{}", index + 1, total_entries),
+                    done: false,
+                    success: false,
+                    error: None,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn find_best_project_json_path(root: &Path) -> Option<PathBuf> {
+    use walkdir::WalkDir;
+
+    let mut candidates = Vec::new();
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let score = score_project_json_candidate(path, &json);
+        if score > 0 {
+            candidates.push((score, path.to_path_buf()));
+        }
+    }
+
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+fn score_project_json_candidate(path: &Path, json: &serde_json::Value) -> i32 {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+
+    let lower_name = file_name.to_ascii_lowercase();
+    let mut score = 0;
+
+    if lower_name == "project.json" {
+        score += 100;
+    }
+    if lower_name.contains("project") {
+        score += 40;
+    }
+    if json.get("rows").and_then(|value| value.as_array()).is_some() {
+        score += 40;
+    }
+    if json.get("styling").map(|value| value.is_object()).unwrap_or(false) {
+        score += 25;
+    }
+    if extract_project_name(json).is_some() {
+        score += 15;
+    }
+    if extract_first_row_title(json).is_some() {
+        score += 10;
+    }
+
+    score
 }
 
 fn resolve_project_json_url(mut url: tauri::Url) -> Result<tauri::Url, String> {
@@ -631,6 +1134,28 @@ fn unique_path(path: std::path::PathBuf) -> std::path::PathBuf {
     parent.join(format!("{}-{}.{}", stem, Uuid::new_v4(), ext))
 }
 
+fn unique_dir_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path.parent().map(|value| value.to_path_buf()).unwrap_or_default();
+    let base = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project")
+        .to_string();
+
+    for index in 2..10000 {
+        let candidate = parent.join(format!("{}-{}", base, index));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    parent.join(format!("{}-{}", base, Uuid::new_v4()))
+}
+
 fn inline_downloaded_project_images(
     bytes: &[u8],
     base_url: &tauri::Url,
@@ -663,6 +1188,30 @@ fn inline_downloaded_project_images(
     );
 
     let cache = download_images_parallel(app, task_id, image_refs)?;
+    replace_image_refs(&mut json, base_url, &cache);
+    serde_json::to_vec(&json).map_err(|e| format!("Failed to serialize downloaded project: {}", e))
+}
+
+fn inline_downloaded_project_images_silent(
+    bytes: &[u8],
+    base_url: &tauri::Url,
+) -> Result<Vec<u8>, String> {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("Downloaded file is not valid JSON: {}", e))?;
+    let image_refs = collect_image_refs(&json, base_url);
+
+    if image_refs.is_empty() {
+        return serde_json::to_vec(&json)
+            .map_err(|e| format!("Failed to serialize downloaded project: {}", e));
+    }
+
+    let mut cache = HashMap::new();
+    for url in image_refs {
+        if let Some(data) = download_image_as_data_uri(&url) {
+            cache.insert(url.to_string(), data);
+        }
+    }
+
     replace_image_refs(&mut json, base_url, &cache);
     serde_json::to_vec(&json).map_err(|e| format!("Failed to serialize downloaded project: {}", e))
 }
@@ -882,6 +1431,10 @@ fn download_images_parallel(
 
 fn emit_download_progress(app: tauri::AppHandle, payload: DownloadProjectProgress) {
     let _ = app.emit("download-project-progress", payload);
+}
+
+fn emit_catalog_import_progress(app: tauri::AppHandle, payload: CatalogImportProgress) {
+    let _ = app.emit("download-catalog-progress", payload);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -29,4 +29,5 @@ walkdir = "2"
 mime_guess = "2"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+zip = "2"
 

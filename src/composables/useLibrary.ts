@@ -38,6 +38,10 @@ export function useLibrary() {
     return invoke<string>("start_download_project", { url });
   }
 
+  async function startDownloadCatalogEntry(taskId: string, websiteUrl: string, zipUrl: string, projectName: string): Promise<string> {
+    return invoke<string>("start_download_catalog_entry", { taskId, websiteUrl, zipUrl, projectName });
+  }
+
   async function addProjectsBulk(filePaths: string[]) {
     const added: Project[] = [];
     for (const fp of filePaths) {
@@ -99,6 +103,7 @@ export function useLibrary() {
     loadViewers,
     addProject,
     startDownloadProject,
+    startDownloadCatalogEntry,
     addProjectsBulk,
     removeProject,
     clearLibrary,

@@ -26,5 +26,12 @@ export interface Viewer {
   name: string;
 }
 
+export interface CatalogEntry {
+  name: string;
+  date: string;
+  website: string;
+  link: string;
+}
+
 export type SortKey = "name" | "date_added";
 export type Theme = "light" | "dark" | "system";
