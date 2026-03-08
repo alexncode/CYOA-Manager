@@ -22,7 +22,7 @@ $zipPath = Join-Path $releaseRoot ("{0}_{1}_portable_x64.zip" -f $productName, $
 if (-not $SkipBuild) {
   Push-Location $repoRoot
   try {
-    pnpm tauri build --bundles none
+    pnpm tauri build --no-bundle
     if ($LASTEXITCODE -ne 0) {
       throw "Portable build failed."
     }

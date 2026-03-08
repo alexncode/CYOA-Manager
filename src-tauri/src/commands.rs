@@ -164,7 +164,7 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
 }
 
 fn resolve_project_json_url(mut url: tauri::Url) -> Result<tauri::Url, String> {
-    if url.path().to_ascii_lowercase().ends_with("project.json") {
+    if is_direct_project_json_url(&url) {
         return Ok(url);
     }
 
@@ -328,11 +328,55 @@ fn parse_project_json_candidate(candidate: &str, page_url: &tauri::Url) -> Optio
         return None;
     }
 
-    if parsed.path().to_ascii_lowercase().ends_with("project.json") {
+    if is_direct_project_json_url(&parsed) {
         Some(parsed)
     } else {
         None
     }
+}
+
+fn is_direct_project_json_url(url: &tauri::Url) -> bool {
+    url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .map(|segment| segment.to_ascii_lowercase().ends_with(".json"))
+        .unwrap_or(false)
+}
+
+fn detect_default_viewer_preference(json: &serde_json::Value) -> Option<String> {
+    if is_icc_plus_project(json) {
+        Some(slugify("ICC2 Plus"))
+    } else {
+        None
+    }
+}
+
+fn is_icc_plus_project(json: &serde_json::Value) -> bool {
+    let Some(root) = json.as_object() else {
+        return false;
+    };
+
+    let Some(version) = root.get("version").and_then(|value| value.as_str()) else {
+        return false;
+    };
+
+    looks_like_icc_plus_version(version)
+        && root.get("rows").and_then(|value| value.as_array()).is_some()
+        && root.get("styling").map(|value| value.is_object()).unwrap_or(false)
+}
+
+fn looks_like_icc_plus_version(version: &str) -> bool {
+    let mut segments = version.split('.');
+    let first = segments.next().filter(|segment| !segment.is_empty());
+    let second = segments.next().filter(|segment| !segment.is_empty());
+
+    if first.is_none() || second.is_none() {
+        return false;
+    }
+
+    version
+        .split('.')
+        .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Result<Project, String> {
@@ -370,6 +414,7 @@ fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Resu
     };
 
     let cover_image = extract_cover_image(&json);
+    let viewer_preference = detect_default_viewer_preference(&json);
 
     let project = Project {
         id: Uuid::new_v4().to_string(),
@@ -377,7 +422,7 @@ fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Resu
         description: String::new(),
         cover_image,
         file_path,
-        viewer_preference: None,
+        viewer_preference,
         date_added: Utc::now().to_rfc3339(),
         tags: Vec::new(),
         file_missing: false,

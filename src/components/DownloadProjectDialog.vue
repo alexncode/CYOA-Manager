@@ -101,7 +101,7 @@ async function submit() {
       <h2>Download Project</h2>
 
       <p class="sub">
-        Paste a project URL or a cyoa.cafe page URL. Linked images will be downloaded in the background and inlined automatically.
+        Paste a project URL, a direct JSON link, or a cyoa.cafe page URL. Linked images will be downloaded in the background and inlined automatically.
       </p>
 
       <label>
@@ -109,7 +109,7 @@ async function submit() {
         <input
           v-model="url"
           type="url"
-          placeholder="Example: https://om1cr0n.nekoweb.org/albedo/"
+          placeholder="Example: https://om1cr0n.nekoweb.org/albedo/ or https://example.com/albedo-data.json"
           @keydown.enter.prevent="submit"
           :disabled="downloading"
         />
