@@ -32,3 +32,5 @@ release/
 *.njsproj
 *.sln
 *.sw?
+cyoas/
+save/

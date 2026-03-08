@@ -104,15 +104,25 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
         return Err("Only http:// and https:// URLs are supported".to_string());
     }
 
-    if !parsed.path().to_ascii_lowercase().ends_with("project.json") {
-        let mut path = parsed.path().trim_end_matches('/').to_string();
-        if path.is_empty() {
-            path = "/project.json".to_string();
-        } else {
-            path.push_str("/project.json");
-        }
-        parsed.set_path(&path);
+    if is_cyoa_cafe_host(parsed.host_str()) {
+        emit_download_progress(
+            app.clone(),
+            DownloadProjectProgress {
+                task_id: task_id.to_string(),
+                phase: "resolving-source-url".to_string(),
+                current: 0,
+                total: 1,
+                image_current: 0,
+                image_total: 0,
+                message: "Resolving cyoa.cafe link".to_string(),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
     }
+
+    parsed = resolve_project_json_url(parsed)?;
 
     let response = reqwest::blocking::get(parsed.clone())
         .map_err(|e| format!("Download failed: {}", e))?
@@ -151,6 +161,178 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
     );
 
     Ok(())
+}
+
+fn resolve_project_json_url(mut url: tauri::Url) -> Result<tauri::Url, String> {
+    if url.path().to_ascii_lowercase().ends_with("project.json") {
+        return Ok(url);
+    }
+
+    if is_cyoa_cafe_host(url.host_str()) {
+        if let Some(game_id) = extract_cyoa_cafe_game_id(&url) {
+            if let Some(source_url) = fetch_cyoa_cafe_game_source_url(&game_id)? {
+                let parsed_source = tauri::Url::parse(source_url.trim())
+                    .map_err(|e| format!("Invalid source URL from cyoa.cafe: {}", e))?;
+                return resolve_project_json_url(parsed_source);
+            }
+        }
+
+        let response = reqwest::blocking::get(url.clone())
+            .map_err(|e| format!("Failed to open cyoa.cafe page: {}", e))?
+            .error_for_status()
+            .map_err(|e| format!("Failed to open cyoa.cafe page: {}", e))?;
+        let final_url = tauri::Url::parse(response.url().as_str())
+            .map_err(|e| format!("Failed to parse cyoa.cafe URL: {}", e))?;
+        let html = response
+            .text()
+            .map_err(|e| format!("Failed to read cyoa.cafe page: {}", e))?;
+        if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
+            return Ok(project_url);
+        }
+
+        return Err("Could not find a project.json link on the provided cyoa.cafe page".to_string());
+    }
+
+    let mut path = url.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        path = "/project.json".to_string();
+    } else {
+        path.push_str("/project.json");
+    }
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn is_cyoa_cafe_host(host: Option<&str>) -> bool {
+    host.map(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower == "cyoa.cafe" || lower.ends_with(".cyoa.cafe")
+    })
+    .unwrap_or(false)
+}
+
+fn extract_cyoa_cafe_game_id(url: &tauri::Url) -> Option<String> {
+    let mut segments = url.path_segments()?;
+    let first = segments.next()?;
+    if !first.eq_ignore_ascii_case("game") {
+        return None;
+    }
+
+    let game_id = segments.next()?.trim();
+    if game_id.is_empty() {
+        return None;
+    }
+
+    Some(game_id.to_string())
+}
+
+fn fetch_cyoa_cafe_game_source_url(game_id: &str) -> Result<Option<String>, String> {
+    let api_url = format!(
+        "https://cyoa.cafe/api/collections/games/records/{}?fields=iframe_url,img_or_link",
+        game_id
+    );
+
+    let response = reqwest::blocking::get(&api_url)
+        .map_err(|e| format!("Failed to query cyoa.cafe game API: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("Failed to query cyoa.cafe game API: {}", e))?;
+
+    let body = response
+        .text()
+        .map_err(|e| format!("Failed to read cyoa.cafe game API response: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse cyoa.cafe game API response: {}", e))?;
+
+    let source_url = json
+        .get("iframe_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    if source_url.is_none() {
+        let mode = json
+            .get("img_or_link")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if mode != "link" {
+            return Err("This cyoa.cafe entry does not provide a downloadable project link".to_string());
+        }
+    }
+
+    Ok(source_url)
+}
+
+fn find_project_json_url_in_html(html: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    let needle = "project.json";
+    let lower_html = html.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut seen = HashSet::new();
+
+    while let Some(found_at) = lower_html[cursor..].find(needle) {
+        let index = cursor + found_at;
+        if let Some(token) = extract_url_token_around(html, index, needle.len()) {
+            let cleaned = clean_url_token(&token);
+            if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
+                if let Some(resolved) = parse_project_json_candidate(&cleaned, page_url) {
+                    return Some(resolved);
+                }
+            }
+        }
+        cursor = index + needle.len();
+    }
+
+    None
+}
+
+fn extract_url_token_around(html: &str, center: usize, needle_len: usize) -> Option<String> {
+    let bytes = html.as_bytes();
+    if center >= bytes.len() {
+        return None;
+    }
+
+    let mut left = center;
+    while left > 0 && !is_url_boundary(bytes[left - 1]) {
+        left -= 1;
+    }
+
+    let mut right = (center + needle_len).min(bytes.len());
+    while right < bytes.len() && !is_url_boundary(bytes[right]) {
+        right += 1;
+    }
+
+    html.get(left..right).map(|s| s.to_string())
+}
+
+fn is_url_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || b"\"'<>()[]{};,".contains(&byte)
+}
+
+fn clean_url_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| "\"'`()<>{}[];,".contains(c))
+        .replace("\\/", "/")
+        .replace("&amp;", "&")
+}
+
+fn parse_project_json_candidate(candidate: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    let parsed = if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        tauri::Url::parse(candidate).ok()?
+    } else if candidate.starts_with("//") {
+        tauri::Url::parse(&format!("{}:{}", page_url.scheme(), candidate)).ok()?
+    } else {
+        page_url.join(candidate).ok()?
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    if parsed.path().to_ascii_lowercase().ends_with("project.json") {
+        Some(parsed)
+    } else {
+        None
+    }
 }
 
 fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Result<Project, String> {

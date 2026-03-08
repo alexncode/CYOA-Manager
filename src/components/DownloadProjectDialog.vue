@@ -101,7 +101,7 @@ async function submit() {
       <h2>Download Project</h2>
 
       <p class="sub">
-        Paste a project URL. Linked images will be downloaded in the background and inlined automatically.
+        Paste a project URL or a cyoa.cafe page URL. Linked images will be downloaded in the background and inlined automatically.
       </p>
 
       <label>
