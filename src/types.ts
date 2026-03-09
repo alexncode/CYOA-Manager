@@ -31,6 +31,14 @@ export interface CatalogEntry {
   date: string;
   website: string;
   link: string;
+  author?: string;
+  universe?: string;
+  importer?: string;
+  type?: string;
+  pov?: string;
+  length?: string;
+  tags?: string[];
+  description?: string;
 }
 
 export type SortKey = "name" | "date_added";

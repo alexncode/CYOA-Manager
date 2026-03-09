@@ -30,7 +30,6 @@ pub fn run() {
             start_download_project,
             download_catalog_entry,
             start_download_catalog_entry,
-            fetch_catalog_source,
             remove_project,
             update_project,
             get_project_json,

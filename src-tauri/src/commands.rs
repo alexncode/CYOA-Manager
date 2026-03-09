@@ -164,21 +164,6 @@ pub fn start_download_catalog_entry(
     Ok(task_id)
 }
 
-#[tauri::command]
-pub fn fetch_catalog_source(url: String) -> Result<String, String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err("Missing catalog URL".to_string());
-    }
-
-    reqwest::blocking::get(trimmed)
-        .map_err(|e| format!("Download failed: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed: {}", e))?
-        .text()
-        .map_err(|e| format!("Failed to read catalog source: {}", e))
-}
-
 fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> Result<(), String> {
     emit_download_progress(
         app.clone(),
@@ -442,6 +427,10 @@ fn download_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), Strin
         return download_cyoa_cafe_project_data(url);
     }
 
+    if is_itch_io_host(url.host_str()) {
+        return download_itch_io_project_data(url);
+    }
+
     if is_direct_project_json_url(&url) {
         return download_project_json_bytes(url);
     }
@@ -466,6 +455,30 @@ fn download_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), Strin
     }
 
     Err("Could not find project.json or embedded project data on the provided page".to_string())
+}
+
+fn download_itch_io_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+    let (html, final_url) = fetch_html_page(url, "Failed to open itch.io page")?;
+
+    if let Some(iframe_url) = find_itch_io_iframe_url_in_html(&html, &final_url) {
+        if iframe_url != final_url {
+            return download_project_data(iframe_url);
+        }
+    }
+
+    if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
+        if let Ok(project) = download_project_json_bytes(project_url) {
+            return Ok(project);
+        }
+    }
+
+    if let Some((json, base_url)) = find_embedded_project_data(&html, &final_url)? {
+        let bytes = serde_json::to_vec(&json)
+            .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
+        return Ok((bytes, base_url));
+    }
+
+    Err("Could not find an embedded CYOA iframe, project.json link, or embedded project data on the provided itch.io page".to_string())
 }
 
 fn download_cyoa_cafe_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
@@ -802,6 +815,14 @@ fn is_cyoa_cafe_host(host: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+fn is_itch_io_host(host: Option<&str>) -> bool {
+    host.map(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower == "itch.io" || lower.ends_with(".itch.io")
+    })
+    .unwrap_or(false)
+}
+
 fn extract_cyoa_cafe_game_id(url: &tauri::Url) -> Option<String> {
     let mut segments = url.path_segments()?;
     let first = segments.next()?;
@@ -874,6 +895,125 @@ fn find_project_json_url_in_html(html: &str, page_url: &tauri::Url) -> Option<ta
     }
 
     None
+}
+
+fn find_itch_io_iframe_url_in_html(html: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    let lower_html = html.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut fallback = None;
+
+    while let Some(found_at) = lower_html[cursor..].find("<") {
+        let tag_start = cursor + found_at;
+        let Some(tag_end_relative) = html[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_relative + 1;
+        let tag = &html[tag_start..tag_end];
+
+        if let Some(url) = extract_itch_io_embed_url(tag, page_url) {
+            if points_to_index_html(&url) {
+                return Some(url);
+            }
+
+            if fallback.is_none() {
+                fallback = Some(url);
+            }
+        }
+
+        cursor = tag_end;
+    }
+
+    fallback
+}
+
+fn extract_itch_io_embed_url(tag: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    if let Some(src) = extract_html_attribute(tag, "src") {
+        if let Some(url) = parse_itch_io_embed_candidate(&src, page_url) {
+            return Some(url);
+        }
+    }
+
+    let encoded_iframe = extract_html_attribute(tag, "data-iframe")?;
+    let decoded_iframe = decode_basic_html_entities(&encoded_iframe);
+    let src = extract_html_attribute(&decoded_iframe, "src")?;
+    parse_itch_io_embed_candidate(&src, page_url)
+}
+
+fn parse_itch_io_embed_candidate(raw: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    let normalized = strip_wrapping_url_quotes(
+        decode_basic_html_entities(raw)
+            .replace("\\/", "/")
+            .trim(),
+    );
+
+    let url = if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        tauri::Url::parse(&normalized).ok()?
+    } else if normalized.starts_with("//") {
+        tauri::Url::parse(&format!("{}:{}", page_url.scheme(), normalized)).ok()?
+    } else {
+        page_url.join(&normalized).ok()?
+    };
+
+    if matches!(url.scheme(), "http" | "https") {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn strip_wrapping_url_quotes(value: &str) -> String {
+    let mut normalized = value.trim().to_string();
+
+    loop {
+        let trimmed = normalized
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+            .to_string();
+        let trimmed = trimmed
+            .strip_prefix("%22")
+            .unwrap_or(&trimmed)
+            .strip_suffix("%22")
+            .unwrap_or(&trimmed)
+            .strip_prefix("%27")
+            .unwrap_or(&trimmed)
+            .strip_suffix("%27")
+            .unwrap_or(&trimmed)
+            .strip_prefix("%60")
+            .unwrap_or(&trimmed)
+            .strip_suffix("%60")
+            .unwrap_or(&trimmed)
+            .to_string();
+
+        if trimmed == normalized {
+            return trimmed;
+        }
+
+        normalized = trimmed;
+    }
+}
+
+fn decode_basic_html_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn points_to_index_html(url: &tauri::Url) -> bool {
+    let without_suffix = url
+        .as_str()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url.as_str())
+        .trim_end_matches('/');
+    let lower = without_suffix.to_ascii_lowercase();
+
+    lower.ends_with("/index.html") || lower == "index.html"
 }
 
 fn find_script_urls_in_html(html: &str, page_url: &tauri::Url) -> Vec<tauri::Url> {
