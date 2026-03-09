@@ -1471,6 +1471,7 @@ pub fn open_viewer_window(
     project_id: String,
     viewer_id: String,
     project_name: String,
+    cheats_enabled: bool,
     sessions: State<SessionStore>,
 ) -> Result<(), String> {
     let label = format!("viewer-{}", &Uuid::new_v4().to_string()[..8]);
@@ -1482,6 +1483,7 @@ pub fn open_viewer_window(
             ViewerSession {
                 project_id,
                 viewer_id,
+                cheats_enabled,
             },
         );
     }

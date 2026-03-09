@@ -66,6 +66,13 @@ async function confirmClearLibrary() {
       <p class="hint">
         When set, only one "Open" button appears on each card using this viewer.
       </p>
+      <label class="row checkbox-row">
+        <span>Cheats</span>
+        <input v-model="settings.cheatsEnabled" type="checkbox" />
+      </label>
+      <p class="hint">
+        Toggle the in-viewer cheat overlay menu.
+      </p>
     </section>
 
     <section class="section">
@@ -137,6 +144,15 @@ h1 {
   justify-content: space-between;
   gap: 20px;
   font-size: 0.9rem;
+}
+.checkbox-row {
+  margin-top: 12px;
+}
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 .row select {
   padding: 7px 10px;

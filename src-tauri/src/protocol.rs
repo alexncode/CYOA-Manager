@@ -7,6 +7,11 @@ use tauri::Manager;
 use crate::commands::{slugify, viewers_base_dir};
 use crate::models::{Library, SessionStore};
 
+const VIEWER_OVERLAY_SCRIPT_PATH: &str = "__cyoa_manager_viewer_overlay.js";
+const VIEWER_OVERLAY_SCRIPT: &str = include_str!("viewer_overlay.js");
+const VIEWER_OVERLAY_TEMPLATE_PATH: &str = "__cyoa_manager_viewer_overlay.html";
+const VIEWER_OVERLAY_TEMPLATE: &str = include_str!("viewer_overlay.html");
+
 /// Entry point called from `register_uri_scheme_protocol` in lib.rs.
 ///
 /// URL format: `cyoaview://<session-id>/<path>`
@@ -39,13 +44,21 @@ pub fn handle(app: &tauri::AppHandle, webview_label: &str, request: Request<Vec<
     // Normalize empty path to index.html
     let file_path = if file_path.is_empty() { "index.html" } else { file_path };
 
+    if session.cheats_enabled && file_path == VIEWER_OVERLAY_SCRIPT_PATH {
+        return javascript(VIEWER_OVERLAY_SCRIPT.as_bytes().to_vec());
+    }
+
+    if session.cheats_enabled && file_path == VIEWER_OVERLAY_TEMPLATE_PATH {
+        return html(VIEWER_OVERLAY_TEMPLATE.as_bytes().to_vec());
+    }
+
     // Intercept project.json - serve the real file from the library
     if file_path == "project.json" {
         let lib_state = app.state::<Mutex<Library>>();
         return serve_project_json(&session.project_id, &lib_state);
     }
 
-    if let Some(response) = serve_viewer_asset(&session.viewer_id, file_path) {
+    if let Some(response) = serve_viewer_asset(&session.viewer_id, file_path, session.cheats_enabled) {
         return response;
     }
 
@@ -78,7 +91,7 @@ fn serve_project_json(project_id: &str, state: &Mutex<Library>) -> Response<Vec<
 }
 
 
-fn serve_viewer_asset(viewer_id: &str, file_path: &str) -> Option<Response<Vec<u8>>> {
+fn serve_viewer_asset(viewer_id: &str, file_path: &str, cheats_enabled: bool) -> Option<Response<Vec<u8>>> {
     let base = viewers_base_dir();
 
     // Find the viewer folder whose slug matches viewer_id
@@ -96,7 +109,7 @@ fn serve_viewer_asset(viewer_id: &str, file_path: &str) -> Option<Response<Vec<u
         return None;
     };
 
-    serve_local_asset(&viewer_dir, file_path)
+    serve_local_asset(&viewer_dir, file_path, cheats_enabled)
 }
 
 fn serve_project_asset(
@@ -107,15 +120,22 @@ fn serve_project_asset(
     let lib = state.lock().ok()?;
     let project = lib.projects.iter().find(|p| p.id == project_id)?;
     let project_dir = Path::new(&project.file_path).parent()?.to_path_buf();
-    serve_local_asset(&project_dir, file_path)
+    serve_local_asset(&project_dir, file_path, false)
 }
 
-fn serve_local_asset(base_dir: &Path, file_path: &str) -> Option<Response<Vec<u8>>> {
+fn serve_local_asset(base_dir: &Path, file_path: &str, inject_overlay: bool) -> Option<Response<Vec<u8>>> {
     let full_path = safe_join(base_dir, file_path)?;
     let bytes = std::fs::read(&full_path).ok()?;
     let mime = mime_guess::from_path(&full_path)
         .first_raw()
         .unwrap_or("application/octet-stream");
+
+    let bytes = if inject_overlay && mime.eq_ignore_ascii_case("text/html") {
+        inject_viewer_overlay(bytes)
+    } else {
+        bytes
+    };
+
     Some(
         Response::builder()
             .header("Content-Type", mime)
@@ -124,6 +144,27 @@ fn serve_local_asset(base_dir: &Path, file_path: &str) -> Option<Response<Vec<u8
             .body(bytes)
             .unwrap(),
     )
+}
+
+fn inject_viewer_overlay(bytes: Vec<u8>) -> Vec<u8> {
+    let html = String::from_utf8_lossy(&bytes);
+    let injection = format!("<script src=\"/{VIEWER_OVERLAY_SCRIPT_PATH}\"></script>");
+
+    if html.contains(VIEWER_OVERLAY_SCRIPT_PATH) {
+        return bytes;
+    }
+
+    if html.contains("</body>") {
+        return html.replacen("</body>", &(injection.clone() + "</body>"), 1).into_bytes();
+    }
+
+    if html.contains("</head>") {
+        return html.replacen("</head>", &(injection + "</head>"), 1).into_bytes();
+    }
+
+    let mut updated = html.into_owned();
+    updated.push_str(&injection);
+    updated.into_bytes()
 }
 
 fn safe_join(base_dir: &Path, file_path: &str) -> Option<PathBuf> {
@@ -140,6 +181,24 @@ fn safe_join(base_dir: &Path, file_path: &str) -> Option<PathBuf> {
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
+
+fn javascript(bytes: Vec<u8>) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "application/javascript; charset=utf-8")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(bytes)
+        .unwrap()
+}
+
+fn html(bytes: Vec<u8>) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(bytes)
+        .unwrap()
+}
 
 fn err(status: u16, message: &str) -> Response<Vec<u8>> {
     Response::builder()

@@ -53,6 +53,7 @@ pub struct Viewer {
 pub struct ViewerSession {
     pub project_id: String,
     pub viewer_id: String,
+    pub cheats_enabled: bool,
 }
 
 pub type SessionStore = Mutex<HashMap<String, ViewerSession>>;

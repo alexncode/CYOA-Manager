@@ -1,6 +1,7 @@
 import { ref, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { Project, ProjectPatch, Viewer } from "../types";
+import { useSettings } from "./useSettings";
 
 const projects = ref<Project[]>([]);
 const viewers = ref<Viewer[]>([]);
@@ -8,6 +9,8 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 
 export function useLibrary() {
+  const { settings } = useSettings();
+
   async function loadLibrary() {
     try {
       loading.value = true;
@@ -81,6 +84,7 @@ export function useLibrary() {
       projectId: project.id,
       viewerId,
       projectName: project.name,
+      cheatsEnabled: settings.value.cheatsEnabled,
     });
   }
 

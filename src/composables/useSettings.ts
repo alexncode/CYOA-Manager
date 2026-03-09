@@ -6,6 +6,7 @@ const STORAGE_KEY = "cyoa-manager-settings";
 interface Settings {
   defaultViewer: string | null;
   theme: Theme;
+  cheatsEnabled: boolean;
 }
 
 function load(): Settings {
@@ -19,7 +20,7 @@ function load(): Settings {
 }
 
 function defaults(): Settings {
-  return { defaultViewer: null, theme: "system" };
+  return { defaultViewer: null, theme: "system", cheatsEnabled: true };
 }
 
 const settings = ref<Settings>(load());

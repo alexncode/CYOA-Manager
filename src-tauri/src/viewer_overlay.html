@@ -1,0 +1,135 @@
+<style>
+  #cyoa-manager-viewer-gear {
+    position: fixed;
+    right: 8px;
+    bottom: 8px;
+    width: 30px;
+    height: 30px;
+    border: none;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(78, 84, 96, 0.52);
+    color: rgba(255, 255, 255, 0.9);
+    backdrop-filter: blur(6px);
+    box-shadow: 0 4px 12px rgba(7, 20, 50, 0.18);
+    cursor: pointer;
+    z-index: 2147483647;
+  }
+
+  #cyoa-manager-viewer-gear:hover {
+    background: rgba(78, 84, 96, 0.72);
+  }
+
+  #cyoa-manager-viewer-gear svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  #cyoa-manager-viewer-panel {
+    position: fixed;
+    right: 8px;
+    bottom: 46px;
+    width: 220px;
+    padding: 12px;
+    border-radius: 12px;
+    background: rgba(24, 28, 36, 0.92);
+    color: #eef2ff;
+    box-shadow: 0 14px 34px rgba(7, 20, 50, 0.28);
+    z-index: 2147483647;
+    font: 12px/1.4 system-ui, sans-serif;
+  }
+
+  #cyoa-manager-viewer-panel[hidden] {
+    display: none;
+  }
+
+  .cyoa-manager-panel-title {
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 10px;
+  }
+
+  .cyoa-manager-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .cyoa-manager-row-field {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .cyoa-manager-field-label {
+    color: rgba(220, 228, 245, 0.8);
+    font-size: 11px;
+  }
+
+  #cyoa-manager-viewer-panel select,
+  #cyoa-manager-viewer-panel input {
+    width: 100%;
+    border: 1px solid rgba(150, 165, 196, 0.28);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #f5f7ff;
+    padding: 7px 9px;
+    font: inherit;
+    box-sizing: border-box;
+  }
+
+  #cyoa-manager-viewer-panel select {
+    appearance: auto;
+    -webkit-appearance: menulist;
+    color: #f5f7ff !important;
+    -webkit-text-fill-color: #f5f7ff;
+    text-indent: 0;
+  }
+
+  #cyoa-manager-viewer-panel select option {
+    color: #111827 !important;
+    background: #ffffff;
+  }
+
+  #cyoa-manager-viewer-panel select:focus,
+  #cyoa-manager-viewer-panel input:focus {
+    outline: 1px solid rgba(101, 149, 255, 0.75);
+  }
+
+  .cyoa-manager-action-button {
+    width: 100%;
+    margin-top: 12px;
+    border: 1px solid rgba(150, 165, 196, 0.28);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #f5f7ff;
+    padding: 7px 9px;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .cyoa-manager-action-button:hover {
+    background: rgba(255, 255, 255, 0.16);
+  }
+</style>
+
+<div id="cyoa-manager-viewer-panel" hidden>
+  <div class="cyoa-manager-panel-title">Cheat Menu</div>
+  <div class="cyoa-manager-row-field">
+    <label class="cyoa-manager-field">
+      <span class="cyoa-manager-field-label">Point type</span>
+      <select id="cyoa-manager-point-type-select"></select>
+    </label>
+    <label class="cyoa-manager-field">
+      <span class="cyoa-manager-field-label">Sum</span>
+      <input id="cyoa-manager-point-type-value" type="number" step="1" />
+    </label>
+  </div>
+  <button id="cyoa-manager-remove-reqs" class="cyoa-manager-action-button" type="button">Remove all requirements</button>
+  <button id="cyoa-manager-unlimited-choices" class="cyoa-manager-action-button" type="button">Unlimited Allowed Choices</button>
+</div>
+<button id="cyoa-manager-viewer-gear" type="button" title="CYOA Manager tools" aria-label="CYOA Manager tools">
+  <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35A1.724 1.724 0 0 0 5.38 7.752c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.573-1.065Z" stroke="currentColor" stroke-width="1.5"/><path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" stroke="currentColor" stroke-width="1.5"/></svg>
+</button>
