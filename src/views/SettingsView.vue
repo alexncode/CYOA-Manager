@@ -73,6 +73,19 @@ async function confirmClearLibrary() {
       <p class="hint">
         Toggle the in-viewer cheat overlay menu.
       </p>
+      <label class="row">
+        <span>Download size limit (MB)</span>
+        <input
+          v-model.number="settings.downloadSizeLimitMb"
+          type="number"
+          min="50"
+          max="2000"
+          step="10"
+        />
+      </label>
+      <p class="hint">
+        If a downloaded project exceeds this size, you will be prompted for handling options.
+      </p>
     </section>
 
     <section class="section">
@@ -165,6 +178,17 @@ h1 {
   min-width: 180px;
   cursor: pointer;
 }
+.row input[type="number"] {
+  padding: 7px 10px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.875rem;
+  outline: none;
+  min-width: 120px;
+}
+.row input[type="number"]:focus { border-color: var(--accent); }
 .row select:focus { border-color: var(--accent); }
 .hint {
   margin: 8px 0 0;

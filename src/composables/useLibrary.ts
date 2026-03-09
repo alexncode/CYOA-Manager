@@ -37,12 +37,44 @@ export function useLibrary() {
     return project;
   }
 
-  async function startDownloadProject(url: string): Promise<string> {
-    return invoke<string>("start_download_project", { url });
+  async function startDownloadProject(
+    url: string,
+    maxProjectSizeMb: number,
+  ): Promise<string> {
+    return invoke<string>("start_download_project", {
+      url,
+      maxProjectSizeMb,
+    });
   }
 
-  async function startDownloadCatalogEntry(taskId: string, websiteUrl: string, zipUrl: string, projectName: string): Promise<string> {
-    return invoke<string>("start_download_catalog_entry", { taskId, websiteUrl, zipUrl, projectName });
+  async function startDownloadCatalogEntry(
+    taskId: string,
+    websiteUrl: string,
+    zipUrl: string,
+    projectName: string,
+    maxProjectSizeMb: number,
+  ): Promise<string> {
+    return invoke<string>("start_download_catalog_entry", {
+      taskId,
+      websiteUrl,
+      zipUrl,
+      projectName,
+      maxProjectSizeMb,
+    });
+  }
+
+  async function applyOversizeProjectAction(
+    id: string,
+    strategy: "keep-separate" | "compress" | "do-nothing",
+  ): Promise<Project> {
+    return invoke<Project>("apply_oversize_project_action", { id, strategy });
+  }
+
+  async function startApplyOversizeProjectAction(
+    id: string,
+    strategy: "keep-separate" | "compress" | "do-nothing",
+  ): Promise<string> {
+    return invoke<string>("start_apply_oversize_project_action", { id, strategy });
   }
 
   async function addProjectsBulk(filePaths: string[]) {
@@ -108,6 +140,8 @@ export function useLibrary() {
     addProject,
     startDownloadProject,
     startDownloadCatalogEntry,
+    applyOversizeProjectAction,
+    startApplyOversizeProjectAction,
     addProjectsBulk,
     removeProject,
     clearLibrary,

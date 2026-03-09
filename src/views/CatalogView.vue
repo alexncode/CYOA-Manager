@@ -3,13 +3,17 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { CatalogEntry } from "../types";
 import { useLibrary } from "../composables/useLibrary";
+import { useSettings } from "../composables/useSettings";
+import ProgressBar from "../components/ProgressBar.vue";
+import OversizeActionPrompt from "../components/OversizeActionPrompt.vue";
 
 const GOOGLE_SHEETS_API_KEY = "AIzaSyBRhMRxRwP23DhvQdjCuk1saB5q2Xnp2kk";
 const GOOGLE_SHEETS_SPREADSHEET_ID = "1jxBbWB08myhD8YXePPifsWQG3JH2qZtBs9Y5yYcqE7g";
 const GOOGLE_SHEETS_SHEET_NAME = "Beta Index";
 const LOCAL_CATALOG_URL = "/zip_link_catalog_data.js";
 
-const { loadLibrary, startDownloadCatalogEntry } = useLibrary();
+const { loadLibrary, startDownloadCatalogEntry, startApplyOversizeProjectAction } = useLibrary();
+const { settings } = useSettings();
 
 const entries = ref<CatalogEntry[]>([]);
 const loading = ref(false);
@@ -28,14 +32,48 @@ const tagFilter = ref("");
 const successMessage = ref<string | null>(null);
 const addStatus = ref("");
 const addProgress = ref(0);
+const addSizeText = ref("");
+const addImageCurrent = ref(0);
+const addImageTotal = ref(0);
+const showOversizePrompt = ref(false);
+const oversizeProjectId = ref("");
+const oversizeMb = ref(0);
+const oversizeLimitMb = ref(0);
+const oversizeActionInProgress = ref(false);
 let catalogProgressUnlisten: UnlistenFn | null = null;
+let imageProgressUnlisten: UnlistenFn | null = null;
+let oversizeActionUnlisten: UnlistenFn | null = null;
 let activeCatalogTaskId = "";
+let activeOversizeTaskId = "";
 
 type CatalogProgressPayload = {
   taskId: string;
   phase: string;
   current: number;
   total: number;
+  message: string;
+  done: boolean;
+  success: boolean;
+  error?: string | null;
+};
+
+type DownloadImageProgressPayload = {
+  taskId: string;
+  phase: string;
+  current: number;
+  total: number;
+  imageCurrent: number;
+  imageTotal: number;
+  message: string;
+  done: boolean;
+  success: boolean;
+  error?: string | null;
+};
+
+type OversizeActionPayload = {
+  taskId: string;
+  projectId: string;
+  phase: string;
   message: string;
   done: boolean;
   success: boolean;
@@ -124,6 +162,20 @@ const typeOptions = computed(() => buildOptionList(entries.value.map((entry) => 
 const povOptions = computed(() => buildOptionList(entries.value.map((entry) => entry.pov)));
 const lengthOptions = computed(() => buildOptionList(entries.value.map((entry) => entry.length)));
 const tagOptions = computed(() => buildOptionList(entries.value.flatMap((entry) => entry.tags || [])));
+const addProgressLabel = computed(() => {
+  const cleaned = stripMegabyteText(addStatus.value).trim();
+  return cleaned || "Adding…";
+});
+const addProgressSubtext = computed(() => {
+  const parts: string[] = [];
+  if (addSizeText.value) {
+    parts.push(`Downloaded: ${addSizeText.value}`);
+  }
+  if (addImageTotal.value > 0) {
+    parts.push(`Images: ${addImageCurrent.value} / ${addImageTotal.value}`);
+  }
+  return parts.join(" | ");
+});
 
 onMounted(() => {
   void loadCatalog();
@@ -133,6 +185,14 @@ onBeforeUnmount(() => {
   if (catalogProgressUnlisten) {
     void catalogProgressUnlisten();
     catalogProgressUnlisten = null;
+  }
+  if (imageProgressUnlisten) {
+    void imageProgressUnlisten();
+    imageProgressUnlisten = null;
+  }
+  if (oversizeActionUnlisten) {
+    void oversizeActionUnlisten();
+    oversizeActionUnlisten = null;
   }
 });
 
@@ -161,12 +221,19 @@ async function addEntry(entry: CatalogEntry) {
   successMessage.value = null;
   addStatus.value = "Preparing import…";
   addProgress.value = 0;
+  addSizeText.value = "";
+  addImageCurrent.value = 0;
+  addImageTotal.value = 0;
   const taskId = crypto.randomUUID();
 
   try {
     if (catalogProgressUnlisten) {
       await catalogProgressUnlisten();
       catalogProgressUnlisten = null;
+    }
+    if (imageProgressUnlisten) {
+      await imageProgressUnlisten();
+      imageProgressUnlisten = null;
     }
 
     activeCatalogTaskId = taskId;
@@ -177,6 +244,7 @@ async function addEntry(entry: CatalogEntry) {
       }
 
       addStatus.value = payload.message;
+      addSizeText.value = extractMegabyteText(payload.message);
       addProgress.value = payload.total > 0 ? payload.current / payload.total : 0;
 
       if (payload.done) {
@@ -186,21 +254,144 @@ async function addEntry(entry: CatalogEntry) {
           await catalogProgressUnlisten();
           catalogProgressUnlisten = null;
         }
+        if (imageProgressUnlisten) {
+          await imageProgressUnlisten();
+          imageProgressUnlisten = null;
+        }
 
         if (payload.success) {
           await loadLibrary();
           successMessage.value = payload.message;
         } else {
-          error.value = payload.error || "Catalog import failed.";
+          const err = payload.error || "Catalog import failed.";
+          if (parseOversizeError(err)) {
+            showOversizePrompt.value = true;
+          } else {
+            error.value = err;
+          }
         }
       }
     });
 
-    await startDownloadCatalogEntry(taskId, entry.website, entry.link, entry.name);
+    imageProgressUnlisten = await listen<DownloadImageProgressPayload>("download-project-progress", (event) => {
+      const payload = event.payload;
+      if (!activeCatalogTaskId || payload.taskId !== activeCatalogTaskId) {
+        return;
+      }
+
+      if (payload.imageTotal > 0) {
+        addImageCurrent.value = payload.imageCurrent;
+        addImageTotal.value = payload.imageTotal;
+      }
+
+      const mb = extractMegabyteText(payload.message);
+      if (mb) {
+        addSizeText.value = mb;
+      }
+
+      if (payload.message) {
+        addStatus.value = payload.message;
+      }
+    });
+
+    await startDownloadCatalogEntry(
+      taskId,
+      entry.website,
+      entry.link,
+      entry.name,
+      Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)),
+    );
   } catch (addError) {
     addingLink.value = null;
     activeCatalogTaskId = "";
     error.value = addError instanceof Error ? addError.message : String(addError);
+  }
+}
+
+function extractMegabyteText(message: string): string {
+  const match = message.match(/\b\d+(?:\.\d+)?\s*MB\b/i);
+  return match ? match[0].toUpperCase() : "";
+}
+
+function stripMegabyteText(message: string): string {
+  return message.replace(/\s*\(?\b\d+(?:\.\d+)?\s*MB\b\)?/gi, "").replace(/\s{2,}/g, " ");
+}
+
+function parseOversizeError(errorText: string): boolean {
+  // Format: OVERSIZE|<project_id>|<size_bytes>|<limit_bytes>
+  if (!errorText.startsWith("OVERSIZE|")) {
+    return false;
+  }
+
+  const parts = errorText.split("|");
+  if (parts.length < 4) {
+    return false;
+  }
+
+  const projectId = parts[1] || "";
+  const sizeBytes = Number(parts[2]);
+  const limitBytes = Number(parts[3]);
+  if (!projectId || !Number.isFinite(sizeBytes) || !Number.isFinite(limitBytes) || limitBytes <= 0) {
+    return false;
+  }
+
+  oversizeProjectId.value = projectId;
+  oversizeMb.value = Math.round((sizeBytes / (1024 * 1024)) * 10) / 10;
+  oversizeLimitMb.value = Math.round((limitBytes / (1024 * 1024)) * 10) / 10;
+  return true;
+}
+
+async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do-nothing") {
+  if (!oversizeProjectId.value || oversizeActionInProgress.value) {
+    return;
+  }
+
+  oversizeActionInProgress.value = true;
+  addStatus.value = "Applying post-download action…";
+  addingLink.value = "oversize";
+  error.value = null;
+
+  try {
+    if (oversizeActionUnlisten) {
+      await oversizeActionUnlisten();
+      oversizeActionUnlisten = null;
+    }
+
+    activeOversizeTaskId = "";
+    oversizeActionUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
+      const payload = event.payload;
+      if (!activeOversizeTaskId || payload.taskId !== activeOversizeTaskId) {
+        return;
+      }
+
+      addStatus.value = payload.message;
+      if (!payload.done) {
+        return;
+      }
+
+      oversizeActionInProgress.value = false;
+      addingLink.value = null;
+      activeOversizeTaskId = "";
+      if (oversizeActionUnlisten) {
+        await oversizeActionUnlisten();
+        oversizeActionUnlisten = null;
+      }
+
+      if (payload.success) {
+        await loadLibrary();
+        showOversizePrompt.value = false;
+        successMessage.value = "Oversize project handling applied.";
+      } else {
+        error.value = payload.error || "Oversize action failed.";
+      }
+    });
+
+    activeOversizeTaskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
+  } catch (err) {
+    oversizeActionInProgress.value = false;
+    addingLink.value = null;
+    activeOversizeTaskId = "";
+    error.value = String(err);
   }
 }
 
@@ -534,15 +725,12 @@ function getTypeBadgeClass(type: string | undefined): string {
             <span v-for="tag in entry.tags" :key="tag" class="tag-chip">{{ tag }}</span>
           </div>
 
-          <div v-if="addingLink === entry.catalogKey" class="progress-wrap">
-            <div class="progress-meta">
-              <span>{{ addStatus || "Adding…" }}</span>
-              <span>{{ Math.round(addProgress * 100) }}%</span>
-            </div>
-            <div class="progress-bar">
-              <div class="progress-fill" :style="{ width: `${Math.round(addProgress * 100)}%` }" />
-            </div>
-          </div>
+          <ProgressBar
+            v-if="addingLink === entry.catalogKey"
+            :label="addProgressLabel"
+            :value="addProgress * 100"
+            :details="addProgressSubtext"
+          />
 
           <div class="actions">
             <a class="btn-secondary action-link" :href="entry.website" target="_blank" rel="noreferrer">
@@ -559,6 +747,22 @@ function getTypeBadgeClass(type: string | undefined): string {
           </div>
         </div>
       </article>
+    </div>
+
+    <div
+      v-if="showOversizePrompt"
+      class="confirm-overlay"
+      @click.self="!oversizeActionInProgress && (showOversizePrompt = false)"
+    >
+      <div class="confirm-dialog">
+        <OversizeActionPrompt
+          :final-size-mb="oversizeMb"
+          :limit-mb="oversizeLimitMb"
+          :busy="oversizeActionInProgress"
+          :status="addStatus"
+          @choose="chooseOversizeOption"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -620,6 +824,26 @@ function getTypeBadgeClass(type: string | undefined): string {
 
 .source-link:hover {
   color: var(--accent-hover);
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 210;
+}
+
+.confirm-dialog {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  background: var(--dialog-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 
 .toolbar {
@@ -894,34 +1118,6 @@ function getTypeBadgeClass(type: string | undefined): string {
   flex-wrap: wrap;
   gap: 10px;
   margin-top: auto;
-}
-
-.progress-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.progress-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  font-size: 0.82rem;
-  color: var(--muted);
-}
-
-.progress-bar {
-  height: 10px;
-  border-radius: 999px;
-  overflow: hidden;
-  background: var(--input-bg);
-  border: 1px solid var(--border);
-}
-
-.progress-fill {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.15s ease;
 }
 
 .actions > * {

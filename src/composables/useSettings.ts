@@ -7,6 +7,7 @@ interface Settings {
   defaultViewer: string | null;
   theme: Theme;
   cheatsEnabled: boolean;
+  downloadSizeLimitMb: number;
 }
 
 function load(): Settings {
@@ -20,7 +21,12 @@ function load(): Settings {
 }
 
 function defaults(): Settings {
-  return { defaultViewer: null, theme: "system", cheatsEnabled: true };
+  return {
+    defaultViewer: null,
+    theme: "system",
+    cheatsEnabled: true,
+    downloadSizeLimitMb: 200,
+  };
 }
 
 const settings = ref<Settings>(load());

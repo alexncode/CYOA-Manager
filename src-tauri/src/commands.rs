@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
 
 use base64::Engine;
+use image::{DynamicImage, codecs::jpeg::JpegEncoder};
 use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
@@ -14,6 +15,26 @@ use crate::library::{cyoas_dir, load_library as reload_from_disk, save_library};
 use crate::models::{Library, Project, ProjectPatch, SessionStore, Viewer, ViewerSession};
 
 pub type LibraryState = Mutex<Library>;
+
+#[derive(Clone, Copy)]
+enum OversizeStrategy {
+    Ask,
+    KeepSeparate,
+    Compress,
+    DoNothing,
+}
+
+impl OversizeStrategy {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "ask" => Ok(Self::Ask),
+            "keep-separate" => Ok(Self::KeepSeparate),
+            "compress" => Ok(Self::Compress),
+            "do-nothing" => Ok(Self::DoNothing),
+            other => Err(format!("Invalid oversize strategy: {}", other)),
+        }
+    }
+}
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +58,18 @@ struct CatalogImportProgress {
     phase: String,
     current: usize,
     total: usize,
+    message: String,
+    done: bool,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OversizeActionProgress {
+    task_id: String,
+    project_id: String,
+    phase: String,
     message: String,
     done: bool,
     success: bool,
@@ -68,13 +101,18 @@ pub fn resolve_cover_image_src(
 }
 
 #[tauri::command]
-pub fn start_download_project(app: tauri::AppHandle, url: String) -> Result<String, String> {
+pub fn start_download_project(
+    app: tauri::AppHandle,
+    url: String,
+    max_project_size_mb: u64,
+) -> Result<String, String> {
     let task_id = Uuid::new_v4().to_string();
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
+    let limit_mb = max_project_size_mb.clamp(50, 2000);
 
     thread::spawn(move || {
-        if let Err(error) = run_download_project(&app_handle, &task_id_for_thread, url) {
+        if let Err(error) = run_download_project(&app_handle, &task_id_for_thread, url, limit_mb) {
             emit_download_progress(
                 app_handle,
                 DownloadProjectProgress {
@@ -97,38 +135,13 @@ pub fn start_download_project(app: tauri::AppHandle, url: String) -> Result<Stri
 }
 
 #[tauri::command]
-pub fn download_catalog_entry(
-    website_url: String,
-    zip_url: String,
-    project_name: String,
-    state: State<LibraryState>,
-) -> Result<Project, String> {
-    let desired_name = project_name.trim();
-
-    let mut project = match import_project_from_catalog_website(
-        None,
-        website_url.trim(),
-        desired_name,
-        &state,
-    ) {
-        Ok(project) => project,
-        Err(_) => {
-            let extracted_project = download_catalog_project_zip(zip_url.trim(), desired_name, None)?;
-            add_project_from_path(extracted_project.to_string_lossy().to_string(), &state)?
-        }
-    };
-
-    apply_catalog_project_name_override(&mut project, desired_name, &state)?;
-    Ok(project)
-}
-
-#[tauri::command]
 pub fn start_download_catalog_entry(
     app: tauri::AppHandle,
     task_id: String,
     website_url: String,
     zip_url: String,
     project_name: String,
+    max_project_size_mb: u64,
 ) -> Result<String, String> {
     let task_id = task_id.trim().to_string();
     if task_id.is_empty() {
@@ -136,6 +149,7 @@ pub fn start_download_catalog_entry(
     }
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
+    let limit_mb = max_project_size_mb.clamp(50, 2000);
 
     thread::spawn(move || {
         if let Err(error) = run_download_catalog_entry(
@@ -144,6 +158,7 @@ pub fn start_download_catalog_entry(
             website_url,
             zip_url,
             project_name,
+            limit_mb,
         ) {
             emit_catalog_import_progress(
                 app_handle,
@@ -164,7 +179,12 @@ pub fn start_download_catalog_entry(
     Ok(task_id)
 }
 
-fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> Result<(), String> {
+fn run_download_project(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    url: String,
+    max_project_size_mb: u64,
+) -> Result<(), String> {
     emit_download_progress(
         app.clone(),
         DownloadProjectProgress {
@@ -204,18 +224,40 @@ fn run_download_project(app: &tauri::AppHandle, task_id: &str, url: String) -> R
         );
     }
 
-    let (bytes, base_url) = download_project_data(parsed)?;
+    let (bytes, base_url) = download_project_data(parsed, Some((app, task_id, false)))?;
+
+    emit_download_progress(
+        app.clone(),
+        DownloadProjectProgress {
+            task_id: task_id.to_string(),
+            phase: "downloaded-project".to_string(),
+            current: 0,
+            total: 1,
+            image_current: 0,
+            image_total: 0,
+            message: format!(
+                "Downloaded project payload ({})",
+                format_bytes_megabytes(bytes.len() as u64)
+            ),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
 
     let processed = inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?;
 
     let dir = cyoas_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cyoas folder: {}", e))?;
-
     let destination = unique_path(dir.join(download_file_name(&base_url)));
-    std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
+
+    std::fs::write(&destination, processed)
+        .map_err(|e| format!("Failed to save file: {}", e))?;
 
     let library = app.state::<LibraryState>();
     let project = add_project_from_path(destination.to_string_lossy().to_string(), &library)?;
+    let max_project_size_bytes = max_project_size_mb.saturating_mul(1024 * 1024);
+    ensure_project_within_size_limit(&project.id, max_project_size_bytes, &library)?;
 
     emit_download_progress(
         app.clone(),
@@ -242,6 +284,7 @@ fn run_download_catalog_entry(
     website_url: String,
     zip_url: String,
     project_name: String,
+    max_project_size_mb: u64,
 ) -> Result<(), String> {
     emit_catalog_import_progress(
         app.clone(),
@@ -308,6 +351,9 @@ fn run_download_catalog_entry(
 
     apply_catalog_project_name_override(&mut project, desired_name, &library)?;
 
+    let max_project_size_bytes = max_project_size_mb.saturating_mul(1024 * 1024);
+    ensure_project_within_size_limit(&project.id, max_project_size_bytes, &library)?;
+
     emit_catalog_import_progress(
         app.clone(),
         CatalogImportProgress {
@@ -373,7 +419,7 @@ fn import_project_from_catalog_website(
         );
     }
 
-    let (bytes, base_url) = download_project_data(parsed)?;
+    let (bytes, base_url) = download_project_data(parsed, progress.map(|(app, task_id)| (app, task_id, true)))?;
 
     if let Some((app, task_id)) = progress {
         emit_catalog_import_progress(
@@ -383,7 +429,11 @@ fn import_project_from_catalog_website(
                 phase: "processing-project".to_string(),
                 current: 55,
                 total: 100,
-                message: format!("Processing linked images for {}", project_name),
+                message: format!(
+                    "Processing linked images for {} ({})",
+                    project_name,
+                    format_bytes_megabytes(bytes.len() as u64)
+                ),
                 done: false,
                 success: false,
                 error: None,
@@ -422,28 +472,31 @@ fn import_project_from_catalog_website(
     add_project_from_path(destination.to_string_lossy().to_string(), state)
 }
 
-fn download_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+fn download_project_data(
+    url: tauri::Url,
+    progress: Option<(&tauri::AppHandle, &str, bool)>,
+) -> Result<(Vec<u8>, tauri::Url), String> {
     if is_cyoa_cafe_host(url.host_str()) {
-        return download_cyoa_cafe_project_data(url);
+        return download_cyoa_cafe_project_data(url, progress);
     }
 
     if is_itch_io_host(url.host_str()) {
-        return download_itch_io_project_data(url);
+        return download_itch_io_project_data(url, progress);
     }
 
     if is_direct_project_json_url(&url) {
-        return download_project_json_bytes(url);
+        return download_project_json_bytes(url, progress);
     }
 
     let default_project_url = build_default_project_json_url(&url);
-    if let Ok(project) = download_project_json_bytes(default_project_url) {
+    if let Ok(project) = download_project_json_bytes(default_project_url, progress) {
         return Ok(project);
     }
 
     let (html, final_page_url) = fetch_html_page(url, "Failed to open website")?;
 
     if let Some(project_url) = find_project_json_url_in_html(&html, &final_page_url) {
-        if let Ok(project) = download_project_json_bytes(project_url) {
+        if let Ok(project) = download_project_json_bytes(project_url, progress) {
             return Ok(project);
         }
     }
@@ -457,17 +510,20 @@ fn download_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), Strin
     Err("Could not find project.json or embedded project data on the provided page".to_string())
 }
 
-fn download_itch_io_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+fn download_itch_io_project_data(
+    url: tauri::Url,
+    progress: Option<(&tauri::AppHandle, &str, bool)>,
+) -> Result<(Vec<u8>, tauri::Url), String> {
     let (html, final_url) = fetch_html_page(url, "Failed to open itch.io page")?;
 
     if let Some(iframe_url) = find_itch_io_iframe_url_in_html(&html, &final_url) {
         if iframe_url != final_url {
-            return download_project_data(iframe_url);
+            return download_project_data(iframe_url, progress);
         }
     }
 
     if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
-        if let Ok(project) = download_project_json_bytes(project_url) {
+        if let Ok(project) = download_project_json_bytes(project_url, progress) {
             return Ok(project);
         }
     }
@@ -481,18 +537,21 @@ fn download_itch_io_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url
     Err("Could not find an embedded CYOA iframe, project.json link, or embedded project data on the provided itch.io page".to_string())
 }
 
-fn download_cyoa_cafe_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+fn download_cyoa_cafe_project_data(
+    url: tauri::Url,
+    progress: Option<(&tauri::AppHandle, &str, bool)>,
+) -> Result<(Vec<u8>, tauri::Url), String> {
     if let Some(game_id) = extract_cyoa_cafe_game_id(&url) {
         if let Some(source_url) = fetch_cyoa_cafe_game_source_url(&game_id)? {
             let parsed_source = tauri::Url::parse(source_url.trim())
                 .map_err(|e| format!("Invalid source URL from cyoa.cafe: {}", e))?;
-            return download_project_data(parsed_source);
+            return download_project_data(parsed_source, progress);
         }
     }
 
     let (html, final_url) = fetch_html_page(url, "Failed to open cyoa.cafe page")?;
     if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
-        if let Ok(project) = download_project_json_bytes(project_url) {
+        if let Ok(project) = download_project_json_bytes(project_url, progress) {
             return Ok(project);
         }
     }
@@ -506,7 +565,10 @@ fn download_cyoa_cafe_project_data(url: tauri::Url) -> Result<(Vec<u8>, tauri::U
     Err("Could not find a project.json link or embedded project data on the provided cyoa.cafe page".to_string())
 }
 
-fn download_project_json_bytes(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url), String> {
+fn download_project_json_bytes(
+    url: tauri::Url,
+    progress: Option<(&tauri::AppHandle, &str, bool)>,
+) -> Result<(Vec<u8>, tauri::Url), String> {
     let response = reqwest::blocking::get(url.clone())
         .map_err(|e| format!("Download failed: {}", e))?
         .error_for_status()
@@ -514,14 +576,110 @@ fn download_project_json_bytes(url: tauri::Url) -> Result<(Vec<u8>, tauri::Url),
 
     let final_url = tauri::Url::parse(response.url().as_str())
         .map_err(|e| format!("Failed to parse downloaded URL: {}", e))?;
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    let bytes = read_response_with_progress(response, |downloaded, total| {
+        if let Some((app, task_id, is_catalog)) = progress {
+            emit_transfer_progress(app.clone(), task_id, is_catalog, downloaded, total);
+        }
+    })
+    .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
         .map_err(|e| format!("Downloaded file was not valid JSON: {}", e))?;
 
-    Ok((bytes.to_vec(), final_url))
+    Ok((bytes, final_url))
+}
+
+fn read_response_with_progress<F>(
+    mut response: reqwest::blocking::Response,
+    mut on_progress: F,
+) -> Result<Vec<u8>, std::io::Error>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    let total = response.content_length();
+    let mut downloaded: u64 = 0;
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+
+    on_progress(0, total);
+    loop {
+        let read = response.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        output.extend_from_slice(&chunk[..read]);
+        downloaded = downloaded.saturating_add(read as u64);
+        on_progress(downloaded, total);
+    }
+
+    Ok(output)
+}
+
+fn emit_transfer_progress(
+    app: tauri::AppHandle,
+    task_id: &str,
+    is_catalog: bool,
+    downloaded: u64,
+    total: Option<u64>,
+) {
+    let (current, total_units) = match total {
+        Some(t) if t > 0 => (
+            usize::try_from(downloaded.min(t)).unwrap_or(usize::MAX),
+            usize::try_from(t).unwrap_or(usize::MAX),
+        ),
+        _ => {
+            let fallback_total = downloaded.saturating_add(1);
+            (
+                usize::try_from(downloaded).unwrap_or(usize::MAX),
+                usize::try_from(fallback_total).unwrap_or(usize::MAX),
+            )
+        }
+    };
+
+    let message = match total {
+        Some(t) if t > 0 => format!(
+            "Downloading project payload: {} / {}",
+            format_bytes_megabytes(downloaded),
+            format_bytes_megabytes(t),
+        ),
+        _ => format!(
+            "Downloading project payload: {}",
+            format_bytes_megabytes(downloaded),
+        ),
+    };
+
+    if is_catalog {
+        emit_catalog_import_progress(
+            app,
+            CatalogImportProgress {
+                task_id: task_id.to_string(),
+                phase: "downloading-project".to_string(),
+                current,
+                total: total_units,
+                message,
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    } else {
+        emit_download_progress(
+            app,
+            DownloadProjectProgress {
+                task_id: task_id.to_string(),
+                phase: "fetching-project".to_string(),
+                current,
+                total: total_units,
+                image_current: 0,
+                image_total: 0,
+                message,
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
 }
 
 fn fetch_html_page(url: tauri::Url, error_prefix: &str) -> Result<(String, tauri::Url), String> {
@@ -604,9 +762,47 @@ fn download_catalog_project_zip(
         .map_err(|e| format!("Download failed: {}", e))?
         .error_for_status()
         .map_err(|e| format!("Download failed: {}", e))?;
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("Failed to read ZIP archive: {}", e))?;
+    let bytes = read_response_with_progress(response, |downloaded, total| {
+        if let Some((app, task_id)) = progress {
+            let (current, total_units) = match total {
+                Some(t) if t > 0 => (
+                    usize::try_from(downloaded.min(t)).unwrap_or(usize::MAX),
+                    usize::try_from(t).unwrap_or(usize::MAX),
+                ),
+                _ => {
+                    let fallback_total = downloaded.saturating_add(1);
+                    (
+                        usize::try_from(downloaded).unwrap_or(usize::MAX),
+                        usize::try_from(fallback_total).unwrap_or(usize::MAX),
+                    )
+                }
+            };
+
+            let message = match total {
+                Some(t) if t > 0 => format!(
+                    "Downloading ZIP: {} / {}",
+                    format_bytes_megabytes(downloaded),
+                    format_bytes_megabytes(t),
+                ),
+                _ => format!("Downloading ZIP: {}", format_bytes_megabytes(downloaded)),
+            };
+
+            emit_catalog_import_progress(
+                app.clone(),
+                CatalogImportProgress {
+                    task_id: task_id.to_string(),
+                    phase: "downloading-archive".to_string(),
+                    current,
+                    total: total_units,
+                    message,
+                    done: false,
+                    success: false,
+                    error: None,
+                },
+            );
+        }
+    })
+    .map_err(|e| format!("Failed to read ZIP archive: {}", e))?;
 
     if let Some((app, task_id)) = progress {
         emit_catalog_import_progress(
@@ -616,7 +812,11 @@ fn download_catalog_project_zip(
                 phase: "extracting-archive".to_string(),
                 current: 25,
                 total: 100,
-                message: format!("Extracting {}", project_name),
+                message: format!(
+                    "Extracting {} ({})",
+                    project_name,
+                    format_bytes_megabytes(bytes.len() as u64)
+                ),
                 done: false,
                 success: false,
                 error: None,
@@ -1414,6 +1614,130 @@ pub fn update_project(
 }
 
 #[tauri::command]
+pub fn start_apply_oversize_project_action(
+    app: tauri::AppHandle,
+    id: String,
+    strategy: String,
+) -> Result<String, String> {
+    let strategy = OversizeStrategy::parse(&strategy)?;
+    if matches!(strategy, OversizeStrategy::Ask) {
+        return Err("Strategy 'ask' is not valid for oversize actions".to_string());
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    let project_id_for_thread = id.clone();
+
+    thread::spawn(move || {
+        let outcome = apply_oversize_project_action_internal(&project_id_for_thread, strategy, &app_handle.state::<LibraryState>());
+        match outcome {
+            Ok(_) => {
+                emit_oversize_action_progress(
+                    app_handle,
+                    OversizeActionProgress {
+                        task_id: task_id_for_thread,
+                        project_id: project_id_for_thread,
+                        phase: "done".to_string(),
+                        message: "Oversize action applied".to_string(),
+                        done: true,
+                        success: true,
+                        error: None,
+                    },
+                );
+            }
+            Err(error) => {
+                emit_oversize_action_progress(
+                    app_handle,
+                    OversizeActionProgress {
+                        task_id: task_id_for_thread,
+                        project_id: project_id_for_thread,
+                        phase: "error".to_string(),
+                        message: "Oversize action failed".to_string(),
+                        done: true,
+                        success: false,
+                        error: Some(error),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
+}
+
+#[tauri::command]
+pub fn apply_oversize_project_action(
+    id: String,
+    strategy: String,
+    state: State<LibraryState>,
+) -> Result<Project, String> {
+    let strategy = OversizeStrategy::parse(&strategy)?;
+
+    apply_oversize_project_action_internal(&id, strategy, &state)
+}
+
+fn apply_oversize_project_action_internal(
+    id: &str,
+    strategy: OversizeStrategy,
+    state: &State<LibraryState>,
+) -> Result<Project, String> {
+    let (project_path, project_id) = {
+        let lib = state.lock().map_err(|e| e.to_string())?;
+        let project = lib
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        (project.file_path.clone(), project.id.clone())
+    };
+
+    if matches!(strategy, OversizeStrategy::DoNothing) {
+        let lib = state.lock().map_err(|e| e.to_string())?;
+        let project = lib
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        return Ok(project.clone());
+    }
+
+    let bytes = std::fs::read(&project_path)
+        .map_err(|e| format!("Failed to read project file: {}", e))?;
+
+    let new_path = match strategy {
+        OversizeStrategy::KeepSeparate => {
+            let extracted_path = extract_project_images_to_folder(&project_path, &bytes)?;
+            Some(extracted_path)
+        }
+        OversizeStrategy::Compress => {
+            let compressed = compress_project_file_images(&bytes)?;
+            std::fs::write(&project_path, compressed)
+                .map_err(|e| format!("Failed to write compressed project: {}", e))?;
+            None
+        }
+        OversizeStrategy::Ask => {
+            return Err("Strategy 'ask' is not allowed in apply_oversize_project_action".to_string())
+        }
+        OversizeStrategy::DoNothing => None,
+    };
+
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let project = lib
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .ok_or_else(|| format!("Project not found: {}", project_id))?;
+
+    if let Some(path) = new_path {
+        project.file_path = path.to_string_lossy().to_string();
+    }
+
+    let updated = project.clone();
+    save_library(&lib)?;
+    Ok(updated)
+}
+#[tauri::command]
 pub fn get_project_json(id: String, state: State<LibraryState>) -> Result<String, String> {
     let lib = state.lock().map_err(|e| e.to_string())?;
     let project = lib
@@ -1512,6 +1836,28 @@ pub fn open_viewer_window(
     Ok(())
 }
 
+fn ensure_project_within_size_limit(
+    project_id: &str,
+    max_project_size_bytes: u64,
+    state: &State<LibraryState>,
+) -> Result<(), String> {
+    let lib = state.lock().map_err(|e| e.to_string())?;
+    let project = lib
+        .projects
+        .iter()
+        .find(|candidate| candidate.id == project_id)
+        .ok_or_else(|| format!("Project not found after import: {}", project_id))?;
+
+    let metadata = std::fs::metadata(&project.file_path)
+        .map_err(|e| format!("Failed to read project metadata: {}", e))?;
+    let size = metadata.len();
+
+    if size > max_project_size_bytes {
+        return Err(format!("OVERSIZE|{}|{}|{}", project.id, size, max_project_size_bytes));
+    }
+
+    Ok(())
+}
 fn download_file_name(url: &tauri::Url) -> String {
     let mut base = url
         .path_segments()
@@ -1636,6 +1982,198 @@ fn inline_downloaded_project_images_silent(
 
     replace_image_refs(&mut json, base_url, &cache);
     serde_json::to_vec(&json).map_err(|e| format!("Failed to serialize downloaded project: {}", e))
+}
+
+fn extract_project_images_to_folder(project_file_path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("Failed to parse project for image extraction: {}", e))?;
+
+    let source_path = Path::new(project_file_path);
+    let source_dir = source_path
+        .parent()
+        .ok_or_else(|| "Project path has no parent directory".to_string())?;
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project")
+        .to_string();
+
+    let project_folder = unique_dir_path(source_dir.join(format!("{}-separate", stem)));
+    let images_folder = project_folder.join("images");
+    std::fs::create_dir_all(&images_folder)
+        .map_err(|e| format!("Failed to create images folder: {}", e))?;
+
+    let mut image_index = 0usize;
+    rewrite_data_images_to_files(&mut json, &images_folder, &mut image_index)?;
+
+    let serialized = serde_json::to_vec(&json)
+        .map_err(|e| format!("Failed to serialize project JSON: {}", e))?;
+    let project_json_path = project_folder.join("project.json");
+    std::fs::write(&project_json_path, serialized)
+        .map_err(|e| format!("Failed to write separated project JSON: {}", e))?;
+
+    Ok(project_json_path)
+}
+
+fn compress_project_file_images(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("Failed to parse project for compression: {}", e))?;
+
+    compress_data_uri_images_in_json(&mut json, 150 * 1024)?;
+
+    serde_json::to_vec(&json)
+        .map_err(|e| format!("Failed to serialize compressed project: {}", e))
+}
+
+fn rewrite_data_images_to_files(
+    value: &mut serde_json::Value,
+    images_folder: &Path,
+    image_index: &mut usize,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if let serde_json::Value::String(text) = child {
+                    if is_image_field(key) && text.trim_start().starts_with("data:") {
+                        if let Some((mime, bytes)) = parse_data_uri_image(text) {
+                            *image_index += 1;
+                            let ext = extension_for_mime(&mime);
+                            let filename = format!("img-{:05}.{}", image_index, ext);
+                            let image_path = images_folder.join(&filename);
+                            std::fs::write(&image_path, bytes)
+                                .map_err(|e| format!("Failed writing extracted image: {}", e))?;
+                            *text = format!("images/{}", filename);
+                        }
+                    }
+                } else {
+                    rewrite_data_images_to_files(child, images_folder, image_index)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_data_images_to_files(item, images_folder, image_index)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn compress_data_uri_images_in_json(value: &mut serde_json::Value, max_bytes: usize) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if let serde_json::Value::String(text) = child {
+                    if is_image_field(key) && text.trim_start().starts_with("data:") {
+                        if let Some((mime, bytes)) = parse_data_uri_image(text) {
+                            if let Some(compressed) = compress_image_to_jpeg_limit(&bytes, max_bytes) {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
+                                *text = format!("data:image/jpeg;base64,{}", encoded);
+                            } else {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                                *text = format!("data:{};base64,{}", mime, encoded);
+                            }
+                        }
+                    }
+                } else {
+                    compress_data_uri_images_in_json(child, max_bytes)?;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                compress_data_uri_images_in_json(item, max_bytes)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn parse_data_uri_image(data_uri: &str) -> Option<(String, Vec<u8>)> {
+    let trimmed = data_uri.trim();
+    if !trimmed.starts_with("data:") {
+        return None;
+    }
+
+    let mut parts = trimmed[5..].splitn(2, ',');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    if !header.to_ascii_lowercase().contains(";base64") {
+        return None;
+    }
+
+    let mime = header
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+    Some((mime, bytes))
+}
+
+fn extension_for_mime(mime: &str) -> &'static str {
+    let lower = mime.to_ascii_lowercase();
+    if lower.contains("png") {
+        "png"
+    } else if lower.contains("gif") {
+        "gif"
+    } else if lower.contains("webp") {
+        "webp"
+    } else if lower.contains("bmp") {
+        "bmp"
+    } else {
+        "jpg"
+    }
+}
+
+fn compress_image_to_jpeg_limit(source: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(source).ok()?;
+    let flattened = flatten_alpha(image);
+
+    let mut quality = 85u8;
+    while quality >= 35 {
+        let mut output = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut output, quality);
+        if encoder.encode_image(&flattened).is_ok() && output.len() <= max_bytes {
+            return Some(output);
+        }
+
+        if quality <= 35 {
+            break;
+        }
+        quality = quality.saturating_sub(10);
+    }
+
+    let mut fallback = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut fallback, 35);
+    if encoder.encode_image(&flattened).is_ok() {
+        return Some(fallback);
+    }
+
+    None
+}
+
+fn flatten_alpha(image: DynamicImage) -> DynamicImage {
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut rgb = image::RgbImage::new(width, height);
+
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = pixel[3] as u16;
+        let inv = 255u16.saturating_sub(alpha);
+        let r = ((pixel[0] as u16 * alpha + 255u16 * inv) / 255u16) as u8;
+        let g = ((pixel[1] as u16 * alpha + 255u16 * inv) / 255u16) as u8;
+        let b = ((pixel[2] as u16 * alpha + 255u16 * inv) / 255u16) as u8;
+        rgb.put_pixel(x, y, image::Rgb([r, g, b]));
+    }
+
+    DynamicImage::ImageRgb8(rgb)
 }
 
 fn collect_image_refs(
@@ -1859,6 +2397,10 @@ fn emit_catalog_import_progress(app: tauri::AppHandle, payload: CatalogImportPro
     let _ = app.emit("download-catalog-progress", payload);
 }
 
+fn emit_oversize_action_progress(app: tauri::AppHandle, payload: OversizeActionProgress) {
+    let _ = app.emit("oversize-action-progress", payload);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn extract_project_name(json: &serde_json::Value) -> Option<String> {
@@ -1867,6 +2409,11 @@ fn extract_project_name(json: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn format_bytes_megabytes(bytes: u64) -> String {
+    let megabytes = bytes as f64 / (1024.0 * 1024.0);
+    format!("{:.1} MB", megabytes)
 }
 
 fn extract_cover_image(json: &serde_json::Value) -> Option<String> {

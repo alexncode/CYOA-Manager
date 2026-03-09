@@ -58,6 +58,14 @@ async function openRandomProject() {
         🎲 Random
       </button>
       <a
+        class="nav-link sidebar-external github-link"
+        href="https://github.com/alexncode/CYOA-Manager"
+        target="_blank"
+        rel="noreferrer"
+      >
+        VIEW ON GITHUB
+      </a>
+      <a
         class="nav-link sidebar-external patreon-link"
         href="https://www.patreon.com/interactiveapps"
         target="_blank"
@@ -249,6 +257,16 @@ body {
   padding: 8px 20px;
   font-weight: 600;
   margin: 10px ;
+  font-size: 11px;
+}
+
+.github-link {
+  background: #333;
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 20px;
+  font-weight: 600;
+  margin: 0px 10px ;
   font-size: 11px;
 }
 </style>

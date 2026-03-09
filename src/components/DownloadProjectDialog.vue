@@ -2,13 +2,17 @@
 import { computed, onBeforeUnmount, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLibrary } from "../composables/useLibrary";
+import { useSettings } from "../composables/useSettings";
+import ProgressBar from "./ProgressBar.vue";
+import OversizeActionPrompt from "./OversizeActionPrompt.vue";
 
 const emit = defineEmits<{
   (e: "added"): void;
   (e: "close"): void;
 }>();
 
-const { startDownloadProject } = useLibrary();
+const { startDownloadProject, startApplyOversizeProjectAction } = useLibrary();
+const { settings } = useSettings();
 
 const url = ref("");
 const downloading = ref(false);
@@ -17,9 +21,30 @@ const progress = ref(0);
 const status = ref("");
 const imageCurrent = ref(0);
 const imageTotal = ref(0);
+const downloadedSizeText = ref("");
 let unlisten: UnlistenFn | null = null;
+let oversizeUnlisten: UnlistenFn | null = null;
+const showOversizePrompt = ref(false);
+const oversizeProjectId = ref("");
+const oversizeMb = ref(0);
+const limitMb = ref(0);
+const oversizeActionInProgress = ref(false);
 
 const progressPercent = computed(() => Math.max(0, Math.min(100, Math.round(progress.value * 100))));
+const progressLabel = computed(() => {
+  const cleaned = stripMegabyteText(status.value).trim();
+  return cleaned || "Downloading…";
+});
+const progressSubtext = computed(() => {
+  const parts: string[] = [];
+  if (downloadedSizeText.value) {
+    parts.push(`Downloaded: ${downloadedSizeText.value}`);
+  }
+  if (imageTotal.value > 0) {
+    parts.push(`Images: ${imageCurrent.value} / ${imageTotal.value}`);
+  }
+  return parts.join(" | ");
+});
 
 type ProgressPayload = {
   taskId: string;
@@ -34,10 +59,24 @@ type ProgressPayload = {
   error?: string | null;
 };
 
+type OversizeActionPayload = {
+  taskId: string;
+  projectId: string;
+  phase: string;
+  message: string;
+  done: boolean;
+  success: boolean;
+  error?: string | null;
+};
+
 onBeforeUnmount(() => {
   if (unlisten) {
     void unlisten();
     unlisten = null;
+  }
+  if (oversizeUnlisten) {
+    void oversizeUnlisten();
+    oversizeUnlisten = null;
   }
 });
 
@@ -54,6 +93,10 @@ async function submit() {
   progress.value = 0;
   imageCurrent.value = 0;
   imageTotal.value = 0;
+  downloadedSizeText.value = "";
+  showOversizePrompt.value = false;
+  oversizeProjectId.value = "";
+  oversizeActionInProgress.value = false;
 
   try {
     if (unlisten) {
@@ -69,6 +112,7 @@ async function submit() {
       status.value = payload.message;
       imageCurrent.value = payload.imageCurrent;
       imageTotal.value = payload.imageTotal;
+      downloadedSizeText.value = extractMegabyteText(payload.message);
       progress.value = payload.total > 0 ? payload.current / payload.total : 0;
 
       if (payload.done) {
@@ -82,15 +126,110 @@ async function submit() {
           emit("added");
           emit("close");
         } else {
-          errorMsg.value = payload.error || "Download failed.";
+          const err = payload.error || "Download failed.";
+          if (parseOversizeError(err)) {
+            downloading.value = false;
+            showOversizePrompt.value = true;
+          } else {
+            errorMsg.value = err;
+          }
         }
       }
     });
 
-    taskId = await startDownloadProject(trimmed);
+    taskId = await startDownloadProject(trimmed, Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)));
   } catch (e: any) {
     downloading.value = false;
     errorMsg.value = String(e);
+  }
+}
+
+function extractMegabyteText(message: string): string {
+  const match = message.match(/\b\d+(?:\.\d+)?\s*MB\b/i);
+  return match ? match[0].toUpperCase() : "";
+}
+
+function stripMegabyteText(message: string): string {
+  return message.replace(/\s*\(?\b\d+(?:\.\d+)?\s*MB\b\)?/gi, "").replace(/\s{2,}/g, " ");
+}
+
+function parseOversizeError(error: string): boolean {
+  // Format: OVERSIZE|<project_id>|<size_bytes>|<limit_bytes>
+  if (!error.startsWith("OVERSIZE|")) {
+    return false;
+  }
+
+  const parts = error.split("|");
+  if (parts.length < 4) {
+    return false;
+  }
+
+  const projectId = parts[1] || "";
+  const sizeBytes = Number(parts[2]);
+  const maxBytes = Number(parts[3]);
+  if (!Number.isFinite(sizeBytes) || !Number.isFinite(maxBytes) || maxBytes <= 0) {
+    return false;
+  }
+
+  if (!projectId) {
+    return false;
+  }
+
+  oversizeProjectId.value = projectId;
+  oversizeMb.value = Math.round((sizeBytes / (1024 * 1024)) * 10) / 10;
+  limitMb.value = Math.round((maxBytes / (1024 * 1024)) * 10) / 10;
+  return true;
+}
+
+async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do-nothing") {
+  if (!oversizeProjectId.value || oversizeActionInProgress.value) {
+    return;
+  }
+
+  oversizeActionInProgress.value = true;
+  downloading.value = true;
+  errorMsg.value = "";
+  status.value = "Applying post-download action…";
+
+  try {
+    if (oversizeUnlisten) {
+      await oversizeUnlisten();
+      oversizeUnlisten = null;
+    }
+
+    let taskId = "";
+    oversizeUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
+      const payload = event.payload;
+      if (!taskId || payload.taskId !== taskId) {
+        return;
+      }
+
+      status.value = payload.message;
+      if (!payload.done) {
+        return;
+      }
+
+      oversizeActionInProgress.value = false;
+      downloading.value = false;
+      if (oversizeUnlisten) {
+        await oversizeUnlisten();
+        oversizeUnlisten = null;
+      }
+
+      if (payload.success) {
+        showOversizePrompt.value = false;
+        emit("added");
+        emit("close");
+      } else {
+        errorMsg.value = payload.error || "Oversize action failed.";
+      }
+    });
+
+    taskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
+  } catch (error) {
+    oversizeActionInProgress.value = false;
+    downloading.value = false;
+    errorMsg.value = String(error);
   }
 }
 </script>
@@ -115,20 +254,24 @@ async function submit() {
         />
       </label>
 
-      <div v-if="downloading" class="progress-wrap">
-        <div class="progress-meta">
-          <span>{{ status || "Downloading…" }}</span>
-          <span>{{ progressPercent }}%</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill" :style="{ width: `${progressPercent}%` }" />
-        </div>
-        <div class="progress-sub" v-if="imageTotal > 0">
-          Images: {{ imageCurrent }} / {{ imageTotal }}
-        </div>
-      </div>
+      <ProgressBar
+        v-if="downloading"
+        :label="progressLabel"
+        :value="progressPercent"
+        :details="progressSubtext"
+      />
 
       <div v-if="errorMsg" class="error">{{ errorMsg }}</div>
+
+      <div v-if="showOversizePrompt" class="oversize-prompt">
+        <OversizeActionPrompt
+          :final-size-mb="oversizeMb"
+          :limit-mb="limitMb"
+          :busy="oversizeActionInProgress"
+          :status="status"
+          @choose="chooseOversizeOption"
+        />
+      </div>
 
       <div class="dialog-actions">
         <button class="btn-secondary" :disabled="downloading" @click="emit('close')">Cancel</button>
@@ -182,34 +325,6 @@ input {
 input:focus {
   border-color: var(--accent);
 }
-.progress-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.progress-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  font-size: 0.85rem;
-  color: var(--muted);
-}
-.progress-bar {
-  height: 10px;
-  border-radius: 999px;
-  overflow: hidden;
-  background: var(--input-bg);
-  border: 1px solid var(--border);
-}
-.progress-fill {
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.15s ease;
-}
-.progress-sub {
-  font-size: 0.82rem;
-  color: var(--muted);
-}
 .error {
   background: rgba(200, 50, 50, 0.15);
   border: 1px solid #c33;
@@ -222,5 +337,12 @@ input:focus {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+.oversize-prompt {
+  margin-top: 4px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
 }
 </style>
