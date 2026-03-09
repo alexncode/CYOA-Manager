@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const props = defineProps<{
+defineProps<{
   finalSizeMb: number;
   limitMb: number;
   busy: boolean;
