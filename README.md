@@ -4,10 +4,16 @@ CYOA Manager is a desktop library app for organizing, previewing, and launching 
 
 ## What It Does
 
-- Adds single projects or bulk-imports folders containing `project.json`
-- Detects cover images from project metadata, including relative image paths
-- Launches bundled viewers against selected projects
-- Stores a local library index and per-project metadata such as tags and viewer preference
+- Builds a local library of `project.json` based CYOA projects from files, folders, direct downloads, and the built-in catalog
+
+## Features
+
+- Add a single `project.json` CYOA file or bulk-import folders containing multiple projects
+- Download projects directly from a website or project URL
+- Browse the built-in catalog sourced from Google Sheets - https://docs.google.com/spreadsheets/d/1jxBbWB08myhD8YXePPifsWQG3JH2qZtBs9Y5yYcqE7g/
+- Search, sort, and filter catalog entries by author, universe, importer, type, PoV, length, tags, and free-text matches
+- Support a bulk CYOA download from catalog
+- A simple Cheat Menu allowing to modify points or remove requirements in CYOA's
 
 ## Stack
 

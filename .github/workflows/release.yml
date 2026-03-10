@@ -209,7 +209,8 @@ jobs:
             libssl-dev \
             libsoup-3.0-dev \
             libwebkit2gtk-4.1-dev \
-            patchelf
+            patchelf \
+            rpm
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -229,7 +230,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Linux bundles
-        run: pnpm tauri build --bundles appimage,deb
+        run: pnpm tauri build --bundles appimage,deb,rpm
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -239,6 +240,7 @@ jobs:
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
 
   publish:
     name: Publish release
