@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { CatalogEntry } from "../types";
 import { useLibrary } from "../composables/useLibrary";
@@ -19,7 +19,6 @@ const entries = ref<CatalogEntry[]>([]);
 const loading = ref(false);
 const addingLink = ref<string | null>(null);
 const error = ref<string | null>(null);
-const sourceLabel = ref("remote");
 const search = ref("");
 const sort = ref<"name" | "date">("date");
 const authorFilter = ref("");
@@ -40,6 +39,12 @@ const oversizeProjectId = ref("");
 const oversizeMb = ref(0);
 const oversizeLimitMb = ref(0);
 const oversizeActionInProgress = ref(false);
+const selectedCatalogKeys = ref<string[]>([]);
+const batchDownloadInProgress = ref(false);
+const batchDownloadCompleted = ref(0);
+const batchDownloadTotal = ref(0);
+const batchDownloadMessage = ref("");
+const batchDownloadFailed = ref(0);
 let catalogProgressUnlisten: UnlistenFn | null = null;
 let imageProgressUnlisten: UnlistenFn | null = null;
 let oversizeActionUnlisten: UnlistenFn | null = null;
@@ -176,20 +181,26 @@ const addProgressSubtext = computed(() => {
   }
   return parts.join(" | ");
 });
+const selectedCatalogKeySet = computed(() => new Set(selectedCatalogKeys.value));
+const filteredCatalogKeys = computed(() => displayedList.value.map((entry) => entry.catalogKey));
+const filteredSelectedCount = computed(() => filteredCatalogKeys.value.filter((key) => selectedCatalogKeySet.value.has(key)).length);
+const hasSelectedEntries = computed(() => selectedCatalogKeys.value.length > 0);
+const allFilteredSelected = computed(() => filteredCatalogKeys.value.length > 0 && filteredSelectedCount.value === filteredCatalogKeys.value.length);
+const batchStatusVisible = computed(() => batchDownloadInProgress.value || batchDownloadTotal.value > 0);
+const batchStatusText = computed(() => {
+  if (batchDownloadTotal.value === 0) {
+    return "";
+  }
+
+  return `Downloaded ${batchDownloadCompleted.value} / ${batchDownloadTotal.value}${batchDownloadFailed.value > 0 ? ` • Failed ${batchDownloadFailed.value}` : ""}`;
+});
 
 onMounted(() => {
   void loadCatalog();
 });
 
 onBeforeUnmount(() => {
-  if (catalogProgressUnlisten) {
-    void catalogProgressUnlisten();
-    catalogProgressUnlisten = null;
-  }
-  if (imageProgressUnlisten) {
-    void imageProgressUnlisten();
-    imageProgressUnlisten = null;
-  }
+  void clearCatalogDownloadListeners();
   if (oversizeActionUnlisten) {
     void oversizeActionUnlisten();
     oversizeActionUnlisten = null;
@@ -204,21 +215,93 @@ async function loadCatalog() {
   try {
     const zipFallbacks = await loadZipFallbackMap();
     entries.value = await fetchGoogleSheetCatalogEntries(zipFallbacks);
-    sourceLabel.value = zipFallbacks.size > 0
-      ? "Google Sheets + local ZIP fallback"
-      : "Google Sheets";
+    selectedCatalogKeys.value = [];
   } catch (catalogError) {
     error.value = catalogError instanceof Error ? catalogError.message : String(catalogError);
     entries.value = [];
+    selectedCatalogKeys.value = [];
   } finally {
     loading.value = false;
   }
 }
 
 async function addEntry(entry: CatalogEntry) {
-  addingLink.value = buildCatalogKey(entry);
+  if (batchDownloadInProgress.value) {
+    return;
+  }
+
+  const success = await downloadCatalogEntry(entry, true);
+  if (success) {
+    removeSelectedCatalogKey(buildCatalogKey(entry));
+  }
+}
+
+async function downloadSelectedEntries() {
+  if (batchDownloadInProgress.value || selectedCatalogKeys.value.length === 0) {
+    return;
+  }
+
+  const queue = displayedList.value.filter((entry) => selectedCatalogKeySet.value.has(entry.catalogKey));
+  if (queue.length === 0) {
+    batchDownloadCompleted.value = 0;
+    batchDownloadTotal.value = 0;
+    batchDownloadFailed.value = 0;
+    batchDownloadMessage.value = "";
+    return;
+  }
+
+  batchDownloadInProgress.value = true;
+  batchDownloadCompleted.value = 0;
+  batchDownloadTotal.value = queue.length;
+  batchDownloadFailed.value = 0;
+  batchDownloadMessage.value = `Queued ${queue.length} entr${queue.length === 1 ? "y" : "ies"}`;
   error.value = null;
   successMessage.value = null;
+
+  let completed = 0;
+  let failed = 0;
+
+  try {
+    for (const entry of queue) {
+      batchDownloadMessage.value = `Downloading ${entry.name}`;
+      const success = await downloadCatalogEntry(entry, false);
+      if (!success) {
+        if (showOversizePrompt.value) {
+          batchDownloadMessage.value = `Batch paused while handling ${entry.name}`;
+          break;
+        }
+
+        failed += 1;
+        batchDownloadFailed.value = failed;
+        batchDownloadMessage.value = `Skipped ${entry.name}`;
+        await yieldToUi();
+        continue;
+      }
+
+      completed += 1;
+      batchDownloadCompleted.value = completed;
+      batchDownloadMessage.value = `Finished ${entry.name}`;
+      removeSelectedCatalogKey(entry.catalogKey);
+      await yieldToUi();
+    }
+
+    if (completed + failed === queue.length) {
+      successMessage.value = failed === 0
+        ? `Added ${completed} catalog entr${completed === 1 ? "y" : "ies"} to the library.`
+        : `Added ${completed} catalog entr${completed === 1 ? "y" : "ies"}; skipped ${failed} failed download${failed === 1 ? "" : "s"}.`;
+      batchDownloadMessage.value = failed === 0 ? "Batch complete" : "Batch complete with skipped failures";
+    }
+  } finally {
+    batchDownloadInProgress.value = false;
+  }
+}
+
+async function downloadCatalogEntry(entry: CatalogEntry, showSuccessBanner: boolean): Promise<boolean> {
+  addingLink.value = buildCatalogKey(entry);
+  error.value = null;
+  if (showSuccessBanner) {
+    successMessage.value = null;
+  }
   addStatus.value = "Preparing import…";
   addProgress.value = 0;
   addSizeText.value = "";
@@ -226,86 +309,145 @@ async function addEntry(entry: CatalogEntry) {
   addImageTotal.value = 0;
   const taskId = crypto.randomUUID();
 
-  try {
-    if (catalogProgressUnlisten) {
-      await catalogProgressUnlisten();
-      catalogProgressUnlisten = null;
-    }
-    if (imageProgressUnlisten) {
-      await imageProgressUnlisten();
-      imageProgressUnlisten = null;
-    }
+  await clearCatalogDownloadListeners();
+  activeCatalogTaskId = taskId;
 
-    activeCatalogTaskId = taskId;
-    catalogProgressUnlisten = await listen<CatalogProgressPayload>("download-catalog-progress", async (event) => {
-      const payload = event.payload;
-      if (!activeCatalogTaskId || payload.taskId !== activeCatalogTaskId) {
+  return new Promise<boolean>(async (resolve) => {
+    let settled = false;
+
+    const finish = async (success: boolean, message?: string) => {
+      if (settled) {
         return;
       }
 
-      addStatus.value = payload.message;
-      addSizeText.value = extractMegabyteText(payload.message);
-      addProgress.value = payload.total > 0 ? payload.current / payload.total : 0;
+      settled = true;
+      addingLink.value = null;
+      activeCatalogTaskId = "";
+      await clearCatalogDownloadListeners();
 
-      if (payload.done) {
-        addingLink.value = null;
-        activeCatalogTaskId = "";
-        if (catalogProgressUnlisten) {
-          await catalogProgressUnlisten();
-          catalogProgressUnlisten = null;
+      if (success) {
+        await loadLibrary();
+        if (showSuccessBanner && message) {
+          successMessage.value = message;
         }
-        if (imageProgressUnlisten) {
-          await imageProgressUnlisten();
-          imageProgressUnlisten = null;
+      } else if (message) {
+        error.value = message;
+      }
+
+      resolve(success);
+    };
+
+    try {
+      catalogProgressUnlisten = await listen<CatalogProgressPayload>("download-catalog-progress", async (event) => {
+        const payload = event.payload;
+        if (!activeCatalogTaskId || payload.taskId !== activeCatalogTaskId) {
+          return;
+        }
+
+        addStatus.value = payload.message;
+        addSizeText.value = extractMegabyteText(payload.message);
+        addProgress.value = payload.total > 0 ? payload.current / payload.total : 0;
+
+        if (!payload.done) {
+          return;
         }
 
         if (payload.success) {
-          await loadLibrary();
-          successMessage.value = payload.message;
-        } else {
-          const err = payload.error || "Catalog import failed.";
-          if (parseOversizeError(err)) {
-            showOversizePrompt.value = true;
-          } else {
-            error.value = err;
-          }
+          await finish(true, payload.message);
+          return;
         }
-      }
-    });
 
-    imageProgressUnlisten = await listen<DownloadImageProgressPayload>("download-project-progress", (event) => {
-      const payload = event.payload;
-      if (!activeCatalogTaskId || payload.taskId !== activeCatalogTaskId) {
-        return;
-      }
+        const err = payload.error || "Catalog import failed.";
+        if (parseOversizeError(err)) {
+          showOversizePrompt.value = true;
+          await finish(false);
+          return;
+        }
 
-      if (payload.imageTotal > 0) {
-        addImageCurrent.value = payload.imageCurrent;
-        addImageTotal.value = payload.imageTotal;
-      }
+        await finish(false, err);
+      });
 
-      const mb = extractMegabyteText(payload.message);
-      if (mb) {
-        addSizeText.value = mb;
-      }
+      imageProgressUnlisten = await listen<DownloadImageProgressPayload>("download-project-progress", (event) => {
+        const payload = event.payload;
+        if (!activeCatalogTaskId || payload.taskId !== activeCatalogTaskId) {
+          return;
+        }
 
-      if (payload.message) {
-        addStatus.value = payload.message;
-      }
-    });
+        if (payload.imageTotal > 0) {
+          addImageCurrent.value = payload.imageCurrent;
+          addImageTotal.value = payload.imageTotal;
+        }
 
-    await startDownloadCatalogEntry(
-      taskId,
-      entry.website,
-      entry.link,
-      entry.name,
-      Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)),
-    );
-  } catch (addError) {
-    addingLink.value = null;
-    activeCatalogTaskId = "";
-    error.value = addError instanceof Error ? addError.message : String(addError);
+        const mb = extractMegabyteText(payload.message);
+        if (mb) {
+          addSizeText.value = mb;
+        }
+
+        if (payload.message) {
+          addStatus.value = payload.message;
+        }
+      });
+
+      await startDownloadCatalogEntry(
+        taskId,
+        entry.website,
+        entry.link,
+        entry.name,
+        Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)),
+      );
+    } catch (addError) {
+      await finish(false, addError instanceof Error ? addError.message : String(addError));
+    }
+  });
+}
+
+async function clearCatalogDownloadListeners() {
+  if (catalogProgressUnlisten) {
+    await catalogProgressUnlisten();
+    catalogProgressUnlisten = null;
   }
+
+  if (imageProgressUnlisten) {
+    await imageProgressUnlisten();
+    imageProgressUnlisten = null;
+  }
+}
+
+function isCatalogEntrySelected(entryKey: string): boolean {
+  return selectedCatalogKeySet.value.has(entryKey);
+}
+
+function toggleCatalogEntrySelection(entryKey: string) {
+  if (selectedCatalogKeySet.value.has(entryKey)) {
+    removeSelectedCatalogKey(entryKey);
+    return;
+  }
+
+  selectedCatalogKeys.value = [...selectedCatalogKeys.value, entryKey];
+}
+
+function removeSelectedCatalogKey(entryKey: string) {
+  selectedCatalogKeys.value = selectedCatalogKeys.value.filter((key) => key !== entryKey);
+}
+
+function handleSelectAllFiltered(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  if (!checked) {
+    const filteredSet = new Set(filteredCatalogKeys.value);
+    selectedCatalogKeys.value = selectedCatalogKeys.value.filter((key) => !filteredSet.has(key));
+    return;
+  }
+
+  const next = new Set(selectedCatalogKeys.value);
+  for (const key of filteredCatalogKeys.value) {
+    next.add(key);
+  }
+  selectedCatalogKeys.value = [...next];
+}
+
+async function yieldToUi() {
+  await nextTick();
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 function extractMegabyteText(message: string): string {
@@ -631,9 +773,36 @@ function getTypeBadgeClass(type: string | undefined): string {
 
       <div class="toolbar-spacer" />
 
-      <button class="btn-secondary" :disabled="loading" @click="loadCatalog">
-        {{ loading ? "Loading…" : "Reload Catalog" }}
-      </button>
+      <div class="toolbar-actions">
+        <label v-if="displayedList.length > 0" class="select-all-control">
+          <input
+            type="checkbox"
+            :checked="allFilteredSelected"
+            :disabled="batchDownloadInProgress"
+            @click.stop
+            @change="handleSelectAllFiltered"
+          />
+          <span>Select all filtered</span>
+        </label>
+
+        <div v-if="hasSelectedEntries || batchStatusVisible" class="batch-download-group">
+          <button
+            class="btn-primary"
+            :disabled="loading || addingLink !== null || batchDownloadInProgress || !hasSelectedEntries"
+            @click="downloadSelectedEntries"
+          >
+            {{ batchDownloadInProgress ? "Downloading…" : `Download Selected (${selectedCatalogKeys.length})` }}
+          </button>
+          <div v-if="batchStatusVisible" class="batch-download-status">
+            <div>{{ batchStatusText }}</div>
+            <div v-if="batchDownloadMessage">{{ batchDownloadMessage }}</div>
+          </div>
+        </div>
+
+        <button class="btn-secondary" :disabled="loading || batchDownloadInProgress" @click="loadCatalog">
+          {{ loading ? "Loading…" : "Reload Catalog" }}
+        </button>
+      </div>
     </div>
 
     <div class="filter-row">
@@ -671,12 +840,13 @@ function getTypeBadgeClass(type: string | undefined): string {
         <option value="">All tags</option>
         <option v-for="option in tagOptions" :key="option" :value="option">{{ option }}</option>
       </select>
+
+      <div class="status-bar">
+        <span>{{ displayedList.length }} / {{ entries.length }} entries</span>
+      </div>
     </div>
 
-    <div class="status-bar">
-      <span>Source: {{ sourceLabel }}</span>
-      <span>{{ displayedList.length }} / {{ entries.length }} entries</span>
-    </div>
+
 
     <div v-if="successMessage" class="banner success">{{ successMessage }}</div>
     <div v-if="error" class="banner error">{{ error }}</div>
@@ -685,10 +855,24 @@ function getTypeBadgeClass(type: string | undefined): string {
     <div v-else-if="displayedList.length === 0" class="center-msg">No catalog entries match your filter.</div>
 
     <div v-else class="grid">
-      <article v-for="entry in displayedList" :key="entry.catalogKey" class="card">
+      <article
+        v-for="entry in displayedList"
+        :key="entry.catalogKey"
+        class="card"
+        :class="{ selected: isCatalogEntrySelected(entry.catalogKey) }"
+        @click="toggleCatalogEntrySelection(entry.catalogKey)"
+      >
         <div v-if="entry.type" class="badge badge-type" :class="getTypeBadgeClass(entry.type)">{{ entry.type }}</div>
         <div class="info">
           <div class="card-head">
+              <input
+                type="checkbox"
+                v-if="isCatalogEntrySelected(entry.catalogKey)"
+                :checked="isCatalogEntrySelected(entry.catalogKey)"
+                :disabled="batchDownloadInProgress"
+                @change="toggleCatalogEntrySelection(entry.catalogKey)"
+              />
+
             <div class="title-block">
               <h3 class="name" :title="entry.name">{{ entry.name }}</h3>
               <div v-if="entry.author" class="author-line">
@@ -699,30 +883,17 @@ function getTypeBadgeClass(type: string | undefined): string {
                 <span v-if="entry.universe">{{ entry.universe }}</span>
                 <span v-if="entry.hostLabel">{{ entry.hostLabel }}</span>
                 <span v-if="entry.importer">Imported by {{ entry.importer }}</span>
+                <span v-if="entry.length">{{ entry.length }}</span>
               </div>
             </div>
             <div class="badge badge-date">{{ entry.date }}</div>
-          </div>
-
-          <div class="meta-grid">
-            <div v-if="entry.pov" class="meta-item">
-              <span class="meta-label">PoV</span>
-              <span>{{ entry.pov }}</span>
-            </div>
-            <div v-if="entry.length" class="meta-item">
-              <span class="meta-label">Length</span>
-              <span>{{ entry.length }}</span>
-            </div>
-            <div v-if="entry.universe" class="meta-item meta-item-highlight">
-              <span class="meta-label">Universe</span>
-              <span>{{ entry.universe }}</span>
-            </div>
           </div>
 
           <p v-if="entry.description" class="description">{{ entry.description }}</p>
 
           <div v-if="entry.tags?.length" class="tag-list">
             <span v-for="tag in entry.tags" :key="tag" class="tag-chip">{{ tag }}</span>
+            <span class="tag-chip">PoV: {{ entry.pov }}</span>
           </div>
 
           <ProgressBar
@@ -733,14 +904,14 @@ function getTypeBadgeClass(type: string | undefined): string {
           />
 
           <div class="actions">
-            <a class="btn-secondary action-link" :href="entry.website" target="_blank" rel="noreferrer">
+            <a class="btn-secondary action-link" :href="entry.website" target="_blank" rel="noreferrer" @click.stop>
               Open Site
             </a>
-            <button class="btn-secondary" @click="copyWebsiteLink(entry)">Copy Link</button>
+            <button class="btn-secondary" @click.stop="copyWebsiteLink(entry)">Copy Link</button>
             <button
               class="btn-primary"
-              :disabled="addingLink !== null"
-              @click="addEntry(entry)"
+              :disabled="addingLink !== null || batchDownloadInProgress"
+              @click.stop="addEntry(entry)"
             >
               {{ addingLink === entry.catalogKey ? "Adding…" : "Add to Library" }}
             </button>
@@ -862,7 +1033,7 @@ function getTypeBadgeClass(type: string | undefined): string {
 
 .search {
   flex: 1;
-  min-width: 0;
+  min-width: 150px;
   padding: 7px 12px;
   background: var(--input-bg);
   border: 1px solid var(--border);
@@ -893,6 +1064,36 @@ function getTypeBadgeClass(type: string | undefined): string {
   flex: 1;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.select-all-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-muted);
+}
+
+.batch-download-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.batch-download-status {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
 .filter-row {
   display: flex;
   flex-wrap: wrap;
@@ -901,10 +1102,7 @@ function getTypeBadgeClass(type: string | undefined): string {
 }
 
 .status-bar {
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
+  margin-left: auto;
   padding: 12px 20px 0;
   color: var(--muted);
   font-size: 0.8rem;
@@ -950,6 +1148,12 @@ function getTypeBadgeClass(type: string | undefined): string {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  cursor: pointer;
+}
+
+.card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), var(--catalog-card-shadow);
 }
 
 .badge {
@@ -1008,6 +1212,15 @@ function getTypeBadgeClass(type: string | undefined): string {
   gap: 18px;
   flex-wrap: wrap;
   padding-right: 88px;
+}
+
+.entry-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .title-block {
