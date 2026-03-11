@@ -1,6 +1,6 @@
 [package]
 name = "cyoa-manager"
-version = "0.1.3"
+version = "0.1.4"
 description = "A Tauri App"
 authors = ["om1cr0n"]
 edition = "2021"
