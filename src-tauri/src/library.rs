@@ -63,6 +63,14 @@ pub fn cyoas_dir() -> PathBuf {
     data_root_dir().join("cyoas")
 }
 
+pub fn perk_index_db_path() -> PathBuf {
+    data_root_dir().join("save").join("perk-index.sqlite3")
+}
+
+pub fn perk_images_dir() -> PathBuf {
+    data_root_dir().join("save").join("perk-images")
+}
+
 pub fn load_library() -> Library {
     let path = library_path();
     if path.exists() {

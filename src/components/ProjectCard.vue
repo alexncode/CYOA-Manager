@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Project, Viewer } from "../types";
 
 const props = defineProps<{
@@ -19,6 +20,7 @@ const emit = defineEmits<{
 const menuOpen = ref(false);
 const imageFailed = ref(false);
 const coverImageSrc = ref<string | null>(null);
+const openingSource = ref(false);
 
 const initials = computed(() => {
   const words = props.project.name.trim().split(/\s+/);
@@ -37,6 +39,11 @@ const coverColor = computed(() => {
 const preferredViewer = computed(() => {
   const preferredId = props.project.viewer_preference || props.defaultViewer;
   return props.viewers.find((viewer) => viewer.id === preferredId) ?? null;
+});
+
+const sourceUrl = computed(() => {
+  const raw = props.project.source_url;
+  return raw && raw.trim() ? raw : null;
 });
 
 watch(
@@ -72,6 +79,21 @@ function onOpen(viewerId: string) {
 function onImageError() {
   imageFailed.value = true;
 }
+
+async function onOpenSource() {
+  if (!sourceUrl.value || openingSource.value) {
+    return;
+  }
+
+  openingSource.value = true;
+  try {
+    await openUrl(sourceUrl.value);
+  } catch (error) {
+    console.error("Failed to open source URL:", error);
+  } finally {
+    openingSource.value = false;
+  }
+}
 </script>
 
 <template>
@@ -90,6 +112,15 @@ function onImageError() {
         @error="onImageError"
       />
       <span v-else class="initials">{{ initials }}</span>
+
+      <button
+        v-if="sourceUrl"
+        class="source-btn"
+        :disabled="openingSource"
+        @click.stop="onOpenSource"
+      >
+        Open Source
+      </button>
 
       <div v-if="project.file_missing" class="badge missing-badge">File missing</div>
 
@@ -195,8 +226,37 @@ function onImageError() {
   font-weight: 600;
 }
 .missing-badge {
+  top: 42px;
   background: #e55;
   color: #fff;
+}
+
+.source-btn {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.68);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.card:hover .source-btn {
+  opacity: 1;
+}
+
+.source-btn:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.82);
+}
+
+.source-btn:disabled {
+  cursor: wait;
 }
 
 .menu-btn {

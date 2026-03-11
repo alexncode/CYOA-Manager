@@ -5,6 +5,7 @@ import { useLibrary } from "../composables/useLibrary";
 import { useSettings } from "../composables/useSettings";
 import ProgressBar from "./ProgressBar.vue";
 import OversizeActionPrompt from "./OversizeActionPrompt.vue";
+import type { OversizeActionStrategy } from "../types";
 
 const emit = defineEmits<{
   (e: "added"): void;
@@ -129,7 +130,12 @@ async function submit() {
           const err = payload.error || "Download failed.";
           if (parseOversizeError(err)) {
             downloading.value = false;
-            showOversizePrompt.value = true;
+            const autoAction = getAutoOversizeAction();
+            if (autoAction) {
+              void chooseOversizeOption(autoAction);
+            } else {
+              showOversizePrompt.value = true;
+            }
           } else {
             errorMsg.value = err;
           }
@@ -137,7 +143,7 @@ async function submit() {
       }
     });
 
-    taskId = await startDownloadProject(trimmed, Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)));
+    taskId = await startDownloadProject(trimmed, Math.max(1, Math.floor(settings.value.downloadSizeLimitMb || 200)));
   } catch (e: any) {
     downloading.value = false;
     errorMsg.value = String(e);
@@ -181,9 +187,9 @@ function parseOversizeError(error: string): boolean {
   return true;
 }
 
-async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do-nothing") {
+async function chooseOversizeOption(strategy: OversizeActionStrategy): Promise<boolean> {
   if (!oversizeProjectId.value || oversizeActionInProgress.value) {
-    return;
+    return false;
   }
 
   oversizeActionInProgress.value = true;
@@ -191,46 +197,75 @@ async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do
   errorMsg.value = "";
   status.value = "Applying post-download action…";
 
-  try {
-    if (oversizeUnlisten) {
-      await oversizeUnlisten();
-      oversizeUnlisten = null;
-    }
-
-    let taskId = "";
-    oversizeUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
-      const payload = event.payload;
-      if (!taskId || payload.taskId !== taskId) {
-        return;
-      }
-
-      status.value = payload.message;
-      if (!payload.done) {
-        return;
-      }
-
-      oversizeActionInProgress.value = false;
-      downloading.value = false;
+  return new Promise<boolean>(async (resolve) => {
+    try {
       if (oversizeUnlisten) {
         await oversizeUnlisten();
         oversizeUnlisten = null;
       }
 
-      if (payload.success) {
-        showOversizePrompt.value = false;
-        emit("added");
-        emit("close");
-      } else {
-        errorMsg.value = payload.error || "Oversize action failed.";
-      }
-    });
+      let taskId = "";
+      let pendingPayload: OversizeActionPayload | null = null;
 
-    taskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
-  } catch (error) {
-    oversizeActionInProgress.value = false;
-    downloading.value = false;
-    errorMsg.value = String(error);
-  }
+      let handlePayload: ((payload: OversizeActionPayload) => Promise<void>) | null = null;
+      handlePayload = async (payload: OversizeActionPayload) => {
+        if (!taskId) {
+          pendingPayload = payload;
+          return;
+        }
+
+        if (payload.taskId !== taskId) {
+          return;
+        }
+
+        status.value = payload.message;
+        if (!payload.done) {
+          return;
+        }
+
+        oversizeActionInProgress.value = false;
+        downloading.value = false;
+        if (oversizeUnlisten) {
+          await oversizeUnlisten();
+          oversizeUnlisten = null;
+        }
+
+        if (payload.success) {
+          showOversizePrompt.value = false;
+          emit("added");
+          emit("close");
+          resolve(true);
+        } else {
+          errorMsg.value = payload.error || "Oversize action failed.";
+          resolve(false);
+        }
+      };
+
+      oversizeUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
+        const payload = event.payload;
+        if (handlePayload) {
+          await handlePayload(payload);
+        }
+      });
+
+      taskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
+      if (pendingPayload && handlePayload) {
+        const bufferedPayload = pendingPayload;
+        pendingPayload = null;
+        await handlePayload(bufferedPayload);
+      }
+    } catch (error) {
+      oversizeActionInProgress.value = false;
+      downloading.value = false;
+      errorMsg.value = String(error);
+      resolve(false);
+    }
+  });
+}
+
+function getAutoOversizeAction(): OversizeActionStrategy | null {
+  const action = settings.value.oversizeDefaultAction;
+  return action === "ask" ? null : action;
 }
 </script>
 

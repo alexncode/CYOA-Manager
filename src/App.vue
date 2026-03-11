@@ -51,6 +51,9 @@ async function openRandomProject() {
       <RouterLink to="/settings" class="nav-link" active-class="active">
         ⚙️ Settings
       </RouterLink>
+      <RouterLink to="/perks" class="nav-link" active-class="active">
+        🔎 All Perks
+      </RouterLink>
       <RouterLink to="/catalog" class="nav-link" active-class="active">
         🌐 Infaera Catalog
       </RouterLink>

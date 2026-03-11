@@ -8,6 +8,8 @@ pub struct Project {
     pub name: String,
     pub description: String,
     pub cover_image: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
     pub file_path: String,
     pub viewer_preference: Option<String>,
     pub date_added: String,
@@ -54,6 +56,33 @@ pub struct ViewerSession {
     pub project_id: String,
     pub viewer_id: String,
     pub cheats_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerkIndexStatus {
+    pub ready: bool,
+    pub needs_reindex: bool,
+    pub indexed_projects: usize,
+    pub total_projects: usize,
+    pub perk_count: usize,
+    pub images_enabled: bool,
+    pub last_indexed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerkSearchResult {
+    pub project_id: String,
+    pub project_name: String,
+    pub row_id: String,
+    pub row_title: String,
+    pub object_id: String,
+    pub title: String,
+    pub description: String,
+    pub points: Option<String>,
+    pub addons: Vec<String>,
+    pub image_path: Option<String>,
 }
 
 pub type SessionStore = Mutex<HashMap<String, ViewerSession>>;

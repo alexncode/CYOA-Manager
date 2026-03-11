@@ -13,8 +13,10 @@ use chrono::Utc;
 
 use crate::library::{cyoas_dir, load_library as reload_from_disk, save_library};
 use crate::models::{Library, Project, ProjectPatch, SessionStore, Viewer, ViewerSession};
+use crate::perk_index::{clear_index_if_present, remove_project_from_index_if_present, sync_index_for_project_if_present};
 
 pub type LibraryState = Mutex<Library>;
+const LIBRARY_COVER_IMAGE_MAX_BYTES: usize = 60 * 1024;
 
 #[derive(Clone, Copy)]
 enum OversizeStrategy {
@@ -89,7 +91,7 @@ pub fn get_library(state: State<LibraryState>) -> Result<Vec<Project>, String> {
 
 #[tauri::command]
 pub fn add_project(file_path: String, state: State<LibraryState>) -> Result<Project, String> {
-    add_project_from_path(file_path, &state)
+    add_project_from_path(file_path, &state, None)
 }
 
 #[tauri::command]
@@ -101,6 +103,55 @@ pub fn resolve_cover_image_src(
 }
 
 #[tauri::command]
+pub fn resolve_local_image_src(image_path: String) -> Result<Option<String>, String> {
+    let raw_image_path = image_path.trim();
+    if raw_image_path.is_empty() {
+        return Ok(None);
+    }
+
+    if is_remote_or_embedded_image(raw_image_path) {
+        return Ok(Some(raw_image_path.to_string()));
+    }
+
+    let image_path = PathBuf::from(raw_image_path);
+    if !image_path.exists() {
+        return Ok(None);
+    }
+
+    let mime = mime_guess::from_path(&image_path)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+    let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(Some(format!("data:{};base64,{}", mime, encoded)))
+}
+
+#[tauri::command]
+pub fn compress_library_cover_images(state: State<LibraryState>) -> Result<usize, String> {
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let mut changed = 0usize;
+
+    for project in lib.projects.iter_mut() {
+        let next_cover_image = compress_cover_image_for_library(
+            &project.file_path,
+            project.cover_image.as_deref(),
+            LIBRARY_COVER_IMAGE_MAX_BYTES,
+        )?;
+
+        if next_cover_image != project.cover_image {
+            project.cover_image = next_cover_image;
+            changed += 1;
+        }
+    }
+
+    if changed > 0 {
+        save_library(&lib)?;
+    }
+
+    Ok(changed)
+}
+
+#[tauri::command]
 pub fn start_download_project(
     app: tauri::AppHandle,
     url: String,
@@ -109,7 +160,7 @@ pub fn start_download_project(
     let task_id = Uuid::new_v4().to_string();
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
-    let limit_mb = max_project_size_mb.clamp(50, 2000);
+    let limit_mb = max_project_size_mb.clamp(1, 2000);
 
     thread::spawn(move || {
         if let Err(error) = run_download_project(&app_handle, &task_id_for_thread, url, limit_mb) {
@@ -149,7 +200,7 @@ pub fn start_download_catalog_entry(
     }
     let app_handle = app.clone();
     let task_id_for_thread = task_id.clone();
-    let limit_mb = max_project_size_mb.clamp(50, 2000);
+    let limit_mb = max_project_size_mb.clamp(1, 2000);
 
     thread::spawn(move || {
         if let Err(error) = run_download_catalog_entry(
@@ -255,7 +306,11 @@ fn run_download_project(
         .map_err(|e| format!("Failed to save file: {}", e))?;
 
     let library = app.state::<LibraryState>();
-    let project = add_project_from_path(destination.to_string_lossy().to_string(), &library)?;
+    let project = add_project_from_path(
+        destination.to_string_lossy().to_string(),
+        &library,
+        normalize_source_url(&url),
+    )?;
     let max_project_size_bytes = max_project_size_mb.saturating_mul(1024 * 1024);
     ensure_project_within_size_limit(&project.id, max_project_size_bytes, &library)?;
 
@@ -345,7 +400,11 @@ fn run_download_catalog_entry(
                 },
             );
 
-            add_project_from_path(extracted_project.to_string_lossy().to_string(), &library)?
+            add_project_from_path(
+                extracted_project.to_string_lossy().to_string(),
+                &library,
+                normalize_source_url(&website_url),
+            )?
         }
     };
 
@@ -469,7 +528,11 @@ fn import_project_from_catalog_website(
     let destination = unique_path(dir.join(download_file_name(&base_url)));
     std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
 
-    add_project_from_path(destination.to_string_lossy().to_string(), state)
+    add_project_from_path(
+        destination.to_string_lossy().to_string(),
+        state,
+        normalize_source_url(website_url),
+    )
 }
 
 fn download_project_data(
@@ -1502,7 +1565,11 @@ fn looks_like_icc_plus_version(version: &str) -> bool {
         .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Result<Project, String> {
+fn add_project_from_path(
+    file_path: String,
+    state: &State<LibraryState>,
+    source_url: Option<String>,
+) -> Result<Project, String> {
     let path = Path::new(&file_path);
     if !path.exists() {
         return Err(format!("File does not exist: {}", file_path));
@@ -1536,7 +1603,11 @@ fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Resu
         })
     };
 
-    let cover_image = extract_cover_image(&json);
+    let cover_image = compress_cover_image_for_library(
+        &file_path,
+        extract_cover_image(&json).as_deref(),
+        LIBRARY_COVER_IMAGE_MAX_BYTES,
+    )?;
     let viewer_preference = detect_default_viewer_preference(&json);
 
     let project = Project {
@@ -1544,6 +1615,7 @@ fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Resu
         name,
         description: String::new(),
         cover_image,
+        source_url,
         file_path,
         viewer_preference,
         date_added: Utc::now().to_rfc3339(),
@@ -1554,21 +1626,63 @@ fn add_project_from_path(file_path: String, state: &State<LibraryState>) -> Resu
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.push(project.clone());
     save_library(&lib)?;
+    if let Err(error) = sync_index_for_project_if_present(&project) {
+        eprintln!("Failed to update perk index after add: {}", error);
+    }
     Ok(project)
+}
+
+fn normalize_source_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut url = tauri::Url::parse(trimmed).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+
+    url.set_fragment(None);
+
+    let last_segment = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .map(|segment| segment.to_ascii_lowercase());
+
+    if matches!(last_segment.as_deref(), Some(segment) if segment.ends_with(".json")) {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.pop_if_empty();
+        segments.pop();
+    }
+
+    if url.path().is_empty() {
+        url.set_path("/");
+    }
+
+    Some(url.to_string())
 }
 
 #[tauri::command]
 pub fn remove_project(id: String, state: State<LibraryState>) -> Result<(), String> {
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.retain(|p| p.id != id);
-    save_library(&lib)
+    save_library(&lib)?;
+    if let Err(error) = remove_project_from_index_if_present(&id) {
+        eprintln!("Failed to update perk index after removal: {}", error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn clear_library(state: State<LibraryState>) -> Result<(), String> {
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.clear();
-    save_library(&lib)
+    save_library(&lib)?;
+    if let Err(error) = clear_index_if_present() {
+        eprintln!("Failed to clear perk index: {}", error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1610,6 +1724,9 @@ pub fn update_project(
 
     let updated = project.clone();
     save_library(&lib)?;
+    if let Err(error) = sync_index_for_project_if_present(&updated) {
+        eprintln!("Failed to update perk index after edit: {}", error);
+    }
     Ok(updated)
 }
 
@@ -2434,6 +2551,50 @@ fn extract_cover_image(json: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+fn compress_cover_image_for_library(
+    project_file_path: &str,
+    cover_image: Option<&str>,
+    max_bytes: usize,
+) -> Result<Option<String>, String> {
+    let Some(raw_cover_image) = cover_image.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if raw_cover_image.starts_with("http://") || raw_cover_image.starts_with("https://") || raw_cover_image.starts_with("blob:") {
+        return Ok(Some(raw_cover_image.to_string()));
+    }
+
+    if raw_cover_image.starts_with("data:") {
+        if let Some((_, bytes)) = parse_data_uri_image(raw_cover_image) {
+            if bytes.len() > max_bytes {
+                if let Some(compressed) = compress_image_to_jpeg_limit(&bytes, max_bytes) {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
+                    return Ok(Some(format!("data:image/jpeg;base64,{}", encoded)));
+                }
+            }
+        }
+
+        return Ok(Some(raw_cover_image.to_string()));
+    }
+
+    let image_path = resolve_cover_image_path(project_file_path, raw_cover_image);
+    if !image_path.exists() {
+        return Ok(Some(raw_cover_image.to_string()));
+    }
+
+    let bytes = std::fs::read(&image_path).map_err(|e| e.to_string())?;
+    if bytes.len() <= max_bytes {
+        return Ok(Some(raw_cover_image.to_string()));
+    }
+
+    if let Some(compressed) = compress_image_to_jpeg_limit(&bytes, max_bytes) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(compressed);
+        return Ok(Some(format!("data:image/jpeg;base64,{}", encoded)));
+    }
+
+    Ok(Some(raw_cover_image.to_string()))
 }
 
 fn extract_first_row_title(json: &serde_json::Value) -> Option<String> {

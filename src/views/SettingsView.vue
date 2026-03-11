@@ -4,8 +4,9 @@ import { useSettings } from "../composables/useSettings";
 import { useLibrary } from "../composables/useLibrary";
 
 const { settings, applyTheme } = useSettings();
-const { viewers, clearLibrary } = useLibrary();
+const { viewers, clearLibrary, compressLibraryCoverImages } = useLibrary();
 const clearingLibrary = ref(false);
+const compressingLibraryCovers = ref(false);
 const libraryActionError = ref<string | null>(null);
 const libraryActionMessage = ref<string | null>(null);
 const showClearLibraryConfirm = ref(false);
@@ -34,6 +35,22 @@ async function confirmClearLibrary() {
     libraryActionError.value = String(error);
   } finally {
     clearingLibrary.value = false;
+  }
+}
+
+async function onCompressLibraryCovers() {
+  try {
+    compressingLibraryCovers.value = true;
+    libraryActionError.value = null;
+    libraryActionMessage.value = null;
+    const changed = await compressLibraryCoverImages();
+    libraryActionMessage.value = changed > 0
+      ? `Compressed ${changed} library cover image${changed === 1 ? "" : "s"}.`
+      : "No library cover images needed compression.";
+  } catch (error) {
+    libraryActionError.value = String(error);
+  } finally {
+    compressingLibraryCovers.value = false;
   }
 }
 </script>
@@ -78,19 +95,37 @@ async function confirmClearLibrary() {
         <input
           v-model.number="settings.downloadSizeLimitMb"
           type="number"
-          min="50"
+          min="1"
           max="2000"
           step="10"
         />
       </label>
       <p class="hint">
-        If a downloaded project exceeds this size, you will be prompted for handling options.
+        Projects larger than this threshold trigger the oversize handling rule below.
       </p>
+      <label class="row">
+        <span>Oversize default action</span>
+        <select v-model="settings.oversizeDefaultAction">
+          <option value="ask">Ask</option>
+          <option value="keep-separate">Images Separate</option>
+          <option value="compress">Compress</option>
+        </select>
+      </label>
     </section>
 
 
     <section class="section danger-section">
       <h2>Library Maintenance</h2>
+      <p class="hint">
+        Compress stored library card covers to keep each one at or below 60 KB.
+      </p>
+      <button
+        class="btn-secondary"
+        :disabled="compressingLibraryCovers || clearingLibrary"
+        @click="onCompressLibraryCovers"
+      >
+        {{ compressingLibraryCovers ? "Compressing..." : "Compress library cover images" }}
+      </button>
       <p class="hint">
         Clear the saved library index without deleting the underlying project files.
       </p>

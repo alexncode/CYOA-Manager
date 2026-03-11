@@ -1,6 +1,6 @@
 import { ref, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPatch, Viewer } from "../types";
+import type { PerkIndexStatus, PerkSearchResult, Project, ProjectPatch, Viewer } from "../types";
 import { useSettings } from "./useSettings";
 
 const projects = ref<Project[]>([]);
@@ -101,6 +101,14 @@ export function useLibrary() {
     projects.value = [];
   }
 
+  async function compressLibraryCoverImages(): Promise<number> {
+    const changed = await invoke<number>("compress_library_cover_images");
+    if (changed > 0) {
+      await loadLibrary();
+    }
+    return changed;
+  }
+
   async function updateProject(id: string, patch: ProjectPatch): Promise<Project> {
     const updated = await invoke<Project>("update_project", { id, patch });
     const idx = projects.value.findIndex((p) => p.id === id);
@@ -124,6 +132,33 @@ export function useLibrary() {
     return invoke<string[]>("scan_folder", { folder });
   }
 
+  async function getPerkIndexStatus(): Promise<PerkIndexStatus> {
+    return invoke<PerkIndexStatus>("get_perk_index_status");
+  }
+
+  async function startPerkIndexTask(
+    includeImages: boolean,
+    forceRebuild: boolean,
+  ): Promise<string> {
+    return invoke<string>("start_perk_index_task", { includeImages, forceRebuild });
+  }
+
+  async function syncPerkIndex(includeImages: boolean): Promise<PerkIndexStatus> {
+    return invoke<PerkIndexStatus>("sync_perk_index", { includeImages });
+  }
+
+  async function rebuildPerkIndex(includeImages: boolean): Promise<PerkIndexStatus> {
+    return invoke<PerkIndexStatus>("rebuild_perk_index", { includeImages });
+  }
+
+  async function searchPerks(
+    query: string,
+    limit = 100,
+    offset = 0,
+  ): Promise<PerkSearchResult[]> {
+    return invoke<PerkSearchResult[]>("search_perks", { query, limit, offset });
+  }
+
   const allTags = computed(() => {
     const set = new Set<string>();
     projects.value.forEach((p) => p.tags.forEach((t) => set.add(t)));
@@ -145,9 +180,15 @@ export function useLibrary() {
     addProjectsBulk,
     removeProject,
     clearLibrary,
+    compressLibraryCoverImages,
     updateProject,
     openViewer,
     scanFolder,
+    getPerkIndexStatus,
+    startPerkIndexTask,
+    syncPerkIndex,
+    rebuildPerkIndex,
+    searchPerks,
     allTags,
   };
 }

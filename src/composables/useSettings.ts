@@ -1,5 +1,6 @@
 import { ref, watch } from "vue";
 import type { Theme } from "../types";
+import type { OversizeDefaultAction } from "../types";
 
 const STORAGE_KEY = "cyoa-manager-settings";
 
@@ -8,6 +9,7 @@ interface Settings {
   theme: Theme;
   cheatsEnabled: boolean;
   downloadSizeLimitMb: number;
+  oversizeDefaultAction: OversizeDefaultAction;
 }
 
 function load(): Settings {
@@ -26,6 +28,7 @@ function defaults(): Settings {
     theme: "system",
     cheatsEnabled: true,
     downloadSizeLimitMb: 200,
+    oversizeDefaultAction: "ask",
   };
 }
 

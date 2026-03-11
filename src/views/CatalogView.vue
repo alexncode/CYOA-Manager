@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { CatalogEntry } from "../types";
+import type { CatalogEntry, OversizeActionStrategy } from "../types";
 import { useLibrary } from "../composables/useLibrary";
 import { useSettings } from "../composables/useSettings";
 import ProgressBar from "../components/ProgressBar.vue";
@@ -39,6 +39,8 @@ const oversizeProjectId = ref("");
 const oversizeMb = ref(0);
 const oversizeLimitMb = ref(0);
 const oversizeActionInProgress = ref(false);
+const rememberOversizeChoice = ref(false);
+const batchOversizeAction = ref<OversizeActionStrategy | null>(null);
 const selectedCatalogKeys = ref<string[]>([]);
 const batchDownloadInProgress = ref(false);
 const batchDownloadCompleted = ref(0);
@@ -50,6 +52,7 @@ let imageProgressUnlisten: UnlistenFn | null = null;
 let oversizeActionUnlisten: UnlistenFn | null = null;
 let activeCatalogTaskId = "";
 let activeOversizeTaskId = "";
+let pendingOversizePromptResolver: ((success: boolean) => void) | null = null;
 
 type CatalogProgressPayload = {
   taskId: string;
@@ -205,6 +208,7 @@ onBeforeUnmount(() => {
     void oversizeActionUnlisten();
     oversizeActionUnlisten = null;
   }
+  resolvePendingOversizePrompt(false);
 });
 
 async function loadCatalog() {
@@ -251,6 +255,8 @@ async function downloadSelectedEntries() {
   }
 
   batchDownloadInProgress.value = true;
+  batchOversizeAction.value = null;
+  rememberOversizeChoice.value = false;
   batchDownloadCompleted.value = 0;
   batchDownloadTotal.value = queue.length;
   batchDownloadFailed.value = 0;
@@ -293,6 +299,8 @@ async function downloadSelectedEntries() {
     }
   } finally {
     batchDownloadInProgress.value = false;
+    batchOversizeAction.value = null;
+    rememberOversizeChoice.value = false;
   }
 }
 
@@ -359,8 +367,18 @@ async function downloadCatalogEntry(entry: CatalogEntry, showSuccessBanner: bool
 
         const err = payload.error || "Catalog import failed.";
         if (parseOversizeError(err)) {
-          showOversizePrompt.value = true;
-          await finish(false);
+          const autoAction = getAutoOversizeAction();
+          if (autoAction) {
+            const success = await chooseOversizeOption(autoAction);
+            await finish(success, success ? "Oversize project handling applied." : (error.value || "Oversize action failed."));
+          } else if (batchDownloadInProgress.value) {
+            const success = await waitForBatchOversizeChoice();
+            await finish(success, success ? "Oversize project handling applied." : undefined);
+          } else {
+            rememberOversizeChoice.value = false;
+            showOversizePrompt.value = true;
+            await finish(false);
+          }
           return;
         }
 
@@ -393,7 +411,7 @@ async function downloadCatalogEntry(entry: CatalogEntry, showSuccessBanner: bool
         entry.website,
         entry.link,
         entry.name,
-        Math.max(50, Math.floor(settings.value.downloadSizeLimitMb || 200)),
+        Math.max(10, Math.floor(settings.value.downloadSizeLimitMb || 200)),
       );
     } catch (addError) {
       await finish(false, addError instanceof Error ? addError.message : String(addError));
@@ -483,9 +501,9 @@ function parseOversizeError(errorText: string): boolean {
   return true;
 }
 
-async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do-nothing") {
+async function chooseOversizeOption(strategy: OversizeActionStrategy): Promise<boolean> {
   if (!oversizeProjectId.value || oversizeActionInProgress.value) {
-    return;
+    return false;
   }
 
   oversizeActionInProgress.value = true;
@@ -493,48 +511,123 @@ async function chooseOversizeOption(strategy: "keep-separate" | "compress" | "do
   addingLink.value = "oversize";
   error.value = null;
 
-  try {
-    if (oversizeActionUnlisten) {
-      await oversizeActionUnlisten();
-      oversizeActionUnlisten = null;
-    }
-
-    activeOversizeTaskId = "";
-    oversizeActionUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
-      const payload = event.payload;
-      if (!activeOversizeTaskId || payload.taskId !== activeOversizeTaskId) {
-        return;
-      }
-
-      addStatus.value = payload.message;
-      if (!payload.done) {
-        return;
-      }
-
-      oversizeActionInProgress.value = false;
-      addingLink.value = null;
-      activeOversizeTaskId = "";
+  return new Promise<boolean>(async (resolve) => {
+    try {
       if (oversizeActionUnlisten) {
         await oversizeActionUnlisten();
         oversizeActionUnlisten = null;
       }
 
-      if (payload.success) {
-        await loadLibrary();
-        showOversizePrompt.value = false;
-        successMessage.value = "Oversize project handling applied.";
-      } else {
-        error.value = payload.error || "Oversize action failed.";
-      }
-    });
+      activeOversizeTaskId = "";
+      let pendingPayload: OversizeActionPayload | null = null;
 
-    activeOversizeTaskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
-  } catch (err) {
-    oversizeActionInProgress.value = false;
-    addingLink.value = null;
-    activeOversizeTaskId = "";
-    error.value = String(err);
+      let handlePayload: ((payload: OversizeActionPayload) => Promise<void>) | null = null;
+      handlePayload = async (payload: OversizeActionPayload) => {
+        if (!activeOversizeTaskId) {
+          pendingPayload = payload;
+          return;
+        }
+
+        if (payload.taskId !== activeOversizeTaskId) {
+          return;
+        }
+
+        addStatus.value = payload.message;
+        if (!payload.done) {
+          return;
+        }
+
+        oversizeActionInProgress.value = false;
+        addingLink.value = null;
+        activeOversizeTaskId = "";
+        if (oversizeActionUnlisten) {
+          await oversizeActionUnlisten();
+          oversizeActionUnlisten = null;
+        }
+
+        if (payload.success) {
+          await loadLibrary();
+          showOversizePrompt.value = false;
+          successMessage.value = "Oversize project handling applied.";
+          resolve(true);
+        } else {
+          error.value = payload.error || "Oversize action failed.";
+          resolve(false);
+        }
+      };
+
+      oversizeActionUnlisten = await listen<OversizeActionPayload>("oversize-action-progress", async (event) => {
+        const payload = event.payload;
+        if (handlePayload) {
+          await handlePayload(payload);
+        }
+      });
+
+      activeOversizeTaskId = await startApplyOversizeProjectAction(oversizeProjectId.value, strategy);
+      if (pendingPayload && handlePayload) {
+        const bufferedPayload = pendingPayload;
+        pendingPayload = null;
+        await handlePayload(bufferedPayload);
+      }
+    } catch (err) {
+      oversizeActionInProgress.value = false;
+      addingLink.value = null;
+      activeOversizeTaskId = "";
+      error.value = String(err);
+      resolve(false);
+    }
+  });
+}
+
+function getAutoOversizeAction(): OversizeActionStrategy | null {
+  const action = batchOversizeAction.value ?? settings.value.oversizeDefaultAction;
+  return action === "ask" ? null : action;
+}
+
+function waitForBatchOversizeChoice(): Promise<boolean> {
+  showOversizePrompt.value = true;
+  rememberOversizeChoice.value = false;
+
+  return new Promise<boolean>((resolve) => {
+    pendingOversizePromptResolver = resolve;
+  });
+}
+
+function resolvePendingOversizePrompt(success: boolean) {
+  if (!pendingOversizePromptResolver) {
+    return;
   }
+
+  const resolve = pendingOversizePromptResolver;
+  pendingOversizePromptResolver = null;
+  resolve(success);
+}
+
+async function handleOversizePromptChoice(strategy: OversizeActionStrategy) {
+  const success = await chooseOversizeOption(strategy);
+
+  if (!batchDownloadInProgress.value || !pendingOversizePromptResolver) {
+    return;
+  }
+
+  if (success && rememberOversizeChoice.value) {
+    batchOversizeAction.value = strategy;
+  }
+
+  if (success) {
+    rememberOversizeChoice.value = false;
+    resolvePendingOversizePrompt(true);
+  }
+}
+
+function closeOversizePrompt() {
+  if (oversizeActionInProgress.value) {
+    return;
+  }
+
+  showOversizePrompt.value = false;
+  rememberOversizeChoice.value = false;
+  resolvePendingOversizePrompt(false);
 }
 
 async function fetchCatalogEntries(url: string): Promise<CatalogEntry[]> {
@@ -923,7 +1016,7 @@ function getTypeBadgeClass(type: string | undefined): string {
     <div
       v-if="showOversizePrompt"
       class="confirm-overlay"
-      @click.self="!oversizeActionInProgress && (showOversizePrompt = false)"
+      @click.self="closeOversizePrompt"
     >
       <div class="confirm-dialog">
         <OversizeActionPrompt
@@ -931,8 +1024,16 @@ function getTypeBadgeClass(type: string | undefined): string {
           :limit-mb="oversizeLimitMb"
           :busy="oversizeActionInProgress"
           :status="addStatus"
-          @choose="chooseOversizeOption"
+          @choose="handleOversizePromptChoice"
         />
+        <label v-if="batchDownloadInProgress" class="oversize-remember-choice">
+          <input
+            v-model="rememberOversizeChoice"
+            type="checkbox"
+            :disabled="oversizeActionInProgress"
+          />
+          <span>Don't ask again</span>
+        </label>
       </div>
     </div>
   </div>
@@ -1015,6 +1116,21 @@ function getTypeBadgeClass(type: string | undefined): string {
   border-radius: 12px;
   padding: 20px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.oversize-remember-choice {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.oversize-remember-choice input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
 }
 
 .toolbar {

@@ -1,11 +1,13 @@
 mod commands;
 mod library;
 mod models;
+mod perk_index;
 mod protocol;
 
 use commands::*;
 use library::load_library;
 use models::SessionStore;
+use perk_index::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -26,7 +28,9 @@ pub fn run() {
             get_library,
             add_project,
             clear_library,
+            compress_library_cover_images,
             resolve_cover_image_src,
+            resolve_local_image_src,
             start_download_project,
             start_download_catalog_entry,
             start_apply_oversize_project_action,
@@ -37,6 +41,11 @@ pub fn run() {
             scan_folder,
             get_viewers,
             open_viewer_window,
+            get_perk_index_status,
+            start_perk_index_task,
+            sync_perk_index,
+            rebuild_perk_index,
+            search_perks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

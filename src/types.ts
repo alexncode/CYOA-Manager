@@ -3,6 +3,7 @@ export interface Project {
   name: string;
   description: string;
   cover_image: string | null;
+  source_url?: string | null;
   file_path: string;
   viewer_preference: string | null;
   date_added: string;
@@ -26,6 +27,29 @@ export interface Viewer {
   name: string;
 }
 
+export interface PerkIndexStatus {
+  ready: boolean;
+  needsReindex: boolean;
+  indexedProjects: number;
+  totalProjects: number;
+  perkCount: number;
+  imagesEnabled: boolean;
+  lastIndexedAt: string | null;
+}
+
+export interface PerkSearchResult {
+  projectId: string;
+  projectName: string;
+  rowId: string;
+  rowTitle: string;
+  objectId: string;
+  title: string;
+  description: string;
+  points: string | null;
+  addons: string[];
+  imagePath: string | null;
+}
+
 export interface CatalogEntry {
   name: string;
   date: string;
@@ -43,3 +67,5 @@ export interface CatalogEntry {
 
 export type SortKey = "name" | "date_added";
 export type Theme = "light" | "dark" | "system";
+export type OversizeDefaultAction = "ask" | "keep-separate" | "compress";
+export type OversizeActionStrategy = "keep-separate" | "compress" | "do-nothing";
