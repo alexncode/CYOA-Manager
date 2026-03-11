@@ -1770,8 +1770,8 @@ pub fn scan_folder(folder: String) -> Vec<String> {
 // ─── Viewers ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_viewers() -> Vec<Viewer> {
-    let base = viewers_base_dir();
+pub fn get_viewers(app: tauri::AppHandle) -> Vec<Viewer> {
+    let base = viewers_base_dir(Some(&app));
     let mut viewers = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
@@ -2449,8 +2449,8 @@ fn extract_first_row_title(json: &serde_json::Value) -> Option<String> {
 
 /// Returns the directory containing viewer sub-folders.
 /// Dev:  `<workspace>/public/viewers`
-/// Prod: probes portable and bundled resource layouts (Windows/Linux/macOS).
-pub fn viewers_base_dir() -> std::path::PathBuf {
+/// Prod: resolves bundled resources via Tauri, then falls back to legacy layouts.
+pub fn viewers_base_dir(_app_handle: Option<&tauri::AppHandle>) -> std::path::PathBuf {
     #[cfg(debug_assertions)]
     {
         // CARGO_MANIFEST_DIR is src-tauri/; one level up is the workspace root
@@ -2463,6 +2463,15 @@ pub fn viewers_base_dir() -> std::path::PathBuf {
     }
     #[cfg(not(debug_assertions))]
     {
+        if let Some(app) = _app_handle {
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                let resource_viewers = resource_dir.join("viewers");
+                if resource_viewers.exists() {
+                    return resource_viewers;
+                }
+            }
+        }
+
         let exe = std::env::current_exe().expect("cannot resolve exe path");
         let exe_dir = exe.parent().expect("exe has no parent");
 

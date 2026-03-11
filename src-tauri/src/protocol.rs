@@ -58,7 +58,7 @@ pub fn handle(app: &tauri::AppHandle, webview_label: &str, request: Request<Vec<
         return serve_project_json(&session.project_id, &lib_state);
     }
 
-    if let Some(response) = serve_viewer_asset(&session.viewer_id, file_path, session.cheats_enabled) {
+    if let Some(response) = serve_viewer_asset(app, &session.viewer_id, file_path, session.cheats_enabled) {
         return response;
     }
 
@@ -91,8 +91,13 @@ fn serve_project_json(project_id: &str, state: &Mutex<Library>) -> Response<Vec<
 }
 
 
-fn serve_viewer_asset(viewer_id: &str, file_path: &str, cheats_enabled: bool) -> Option<Response<Vec<u8>>> {
-    let base = viewers_base_dir();
+fn serve_viewer_asset(
+    app: &tauri::AppHandle,
+    viewer_id: &str,
+    file_path: &str,
+    cheats_enabled: bool,
+) -> Option<Response<Vec<u8>>> {
+    let base = viewers_base_dir(Some(app));
 
     // Find the viewer folder whose slug matches viewer_id
     let viewer_dir = if let Ok(entries) = std::fs::read_dir(&base) {

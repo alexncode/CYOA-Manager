@@ -88,13 +88,6 @@ async function confirmClearLibrary() {
       </p>
     </section>
 
-    <section class="section">
-      <h2>Library file location</h2>
-      <p class="hint">
-        The library index (<code>library.json</code>) is stored in a
-        <code>save/</code> folder next to the application executable.
-      </p>
-    </section>
 
     <section class="section danger-section">
       <h2>Library Maintenance</h2>
