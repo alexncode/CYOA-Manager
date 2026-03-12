@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { CatalogEntry, OversizeActionStrategy } from "../types";
 import { useLibrary } from "../composables/useLibrary";
 import { useSettings } from "../composables/useSettings";
@@ -12,7 +13,7 @@ const GOOGLE_SHEETS_SPREADSHEET_ID = "1jxBbWB08myhD8YXePPifsWQG3JH2qZtBs9Y5yYcqE
 const GOOGLE_SHEETS_SHEET_NAME = "Beta Index";
 const LOCAL_CATALOG_URL = "/zip_link_catalog_data.js";
 
-const { loadLibrary, startDownloadCatalogEntry, startApplyOversizeProjectAction } = useLibrary();
+const { projects, loadLibrary, startDownloadCatalogEntry, startOverwriteCatalogEntry, startApplyOversizeProjectAction } = useLibrary();
 const { settings } = useSettings();
 
 const entries = ref<CatalogEntry[]>([]);
@@ -91,17 +92,32 @@ type OversizeActionPayload = {
 type CatalogListEntry = CatalogEntry & {
   catalogKey: string;
   hostLabel: string | null;
+  existingProjectId: string | null;
 };
 
 type GoogleSheetResponse = {
   values?: string[][];
 };
 
+const existingCatalogProjectByWebsite = computed(() => {
+  const map = new Map<string, string>();
+
+  for (const project of projects.value) {
+    const normalizedSourceUrl = normalizeLibrarySourceUrl(project.source_url || "");
+    if (normalizedSourceUrl && !map.has(normalizedSourceUrl)) {
+      map.set(normalizedSourceUrl, project.id);
+    }
+  }
+
+  return map;
+});
+
 const displayedList = computed(() => {
   let list: CatalogListEntry[] = entries.value.map((entry) => ({
     ...entry,
     catalogKey: buildCatalogKey(entry),
     hostLabel: extractHostLabel(entry.website),
+    existingProjectId: existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null,
   }));
   const query = search.value.trim().toLowerCase();
 
@@ -199,6 +215,7 @@ const batchStatusText = computed(() => {
 });
 
 onMounted(() => {
+  void loadLibrary();
   void loadCatalog();
 });
 
@@ -234,7 +251,7 @@ async function addEntry(entry: CatalogEntry) {
     return;
   }
 
-  const success = await downloadCatalogEntry(entry, true);
+  const success = await downloadCatalogEntry(entry, true, getExistingCatalogProjectId(entry));
   if (success) {
     removeSelectedCatalogKey(buildCatalogKey(entry));
   }
@@ -270,7 +287,7 @@ async function downloadSelectedEntries() {
   try {
     for (const entry of queue) {
       batchDownloadMessage.value = `Downloading ${entry.name}`;
-      const success = await downloadCatalogEntry(entry, false);
+      const success = await downloadCatalogEntry(entry, false, entry.existingProjectId);
       if (!success) {
         if (showOversizePrompt.value) {
           batchDownloadMessage.value = `Batch paused while handling ${entry.name}`;
@@ -304,7 +321,11 @@ async function downloadSelectedEntries() {
   }
 }
 
-async function downloadCatalogEntry(entry: CatalogEntry, showSuccessBanner: boolean): Promise<boolean> {
+async function downloadCatalogEntry(
+  entry: CatalogEntry,
+  showSuccessBanner: boolean,
+  existingProjectId: string | null,
+): Promise<boolean> {
   addingLink.value = buildCatalogKey(entry);
   error.value = null;
   if (showSuccessBanner) {
@@ -406,13 +427,25 @@ async function downloadCatalogEntry(entry: CatalogEntry, showSuccessBanner: bool
         }
       });
 
-      await startDownloadCatalogEntry(
-        taskId,
-        entry.website,
-        entry.link,
-        entry.name,
-        Math.max(10, Math.floor(settings.value.downloadSizeLimitMb || 200)),
-      );
+      const sizeLimitMb = Math.max(10, Math.floor(settings.value.downloadSizeLimitMb || 200));
+      if (existingProjectId) {
+        await startOverwriteCatalogEntry(
+          taskId,
+          existingProjectId,
+          entry.website,
+          entry.link,
+          entry.name,
+          sizeLimitMb,
+        );
+      } else {
+        await startDownloadCatalogEntry(
+          taskId,
+          entry.website,
+          entry.link,
+          entry.name,
+          sizeLimitMb,
+        );
+      }
     } catch (addError) {
       await finish(false, addError instanceof Error ? addError.message : String(addError));
     }
@@ -746,6 +779,35 @@ function normalizeCatalogWebsite(website: string): string {
   }
 }
 
+function normalizeLibrarySourceUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+
+    url.hash = "";
+    const segments = url.pathname.split("/").filter(Boolean);
+    const lastSegment = segments[segments.length - 1]?.toLowerCase() || "";
+
+    if (lastSegment.endsWith(".json")) {
+      segments.pop();
+      url.pathname = segments.length > 0 ? `/${segments.join("/")}` : "/";
+    } else if (!url.pathname) {
+      url.pathname = "/";
+    }
+
+    return url.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
 function compareCatalogDates(left: string, right: string): number {
   return left.localeCompare(right);
 }
@@ -818,6 +880,18 @@ async function copyWebsiteLink(entry: CatalogEntry) {
   } catch (copyError) {
     error.value = copyError instanceof Error ? copyError.message : String(copyError);
   }
+}
+
+async function openCatalogWebsite(entry: CatalogEntry) {
+  try {
+    await openUrl(entry.website);
+  } catch (openError) {
+    error.value = openError instanceof Error ? openError.message : String(openError);
+  }
+}
+
+function getExistingCatalogProjectId(entry: CatalogEntry): string | null {
+  return existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null;
 }
 
 function extractHostLabel(website: string): string | null {
@@ -997,16 +1071,16 @@ function getTypeBadgeClass(type: string | undefined): string {
           />
 
           <div class="actions">
-            <a class="btn-secondary action-link" :href="entry.website" target="_blank" rel="noreferrer" @click.stop>
+            <button class="btn-secondary action-link" @click.stop="openCatalogWebsite(entry)">
               Open Site
-            </a>
+            </button>
             <button class="btn-secondary" @click.stop="copyWebsiteLink(entry)">Copy Link</button>
             <button
-              class="btn-primary"
+              :class="entry.existingProjectId ? 'btn-overwrite' : 'btn-primary'"
               :disabled="addingLink !== null || batchDownloadInProgress"
               @click.stop="addEntry(entry)"
             >
-              {{ addingLink === entry.catalogKey ? "Adding…" : "Add to Library" }}
+              {{ addingLink === entry.catalogKey ? (entry.existingProjectId ? "Overwriting…" : "Adding…") : (entry.existingProjectId ? "Overwrite" : "Add to Library") }}
             </button>
           </div>
         </div>
@@ -1454,10 +1528,25 @@ function getTypeBadgeClass(type: string | undefined): string {
 }
 
 .action-link {
-  text-decoration: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.btn-overwrite {
+  background: linear-gradient(135deg, #d97a25, #b74219);
+  border-radius: 10px;
+  color: #fff7ef;
+  border: 1px solid rgba(142, 54, 23, 0.5);
+}
+
+.btn-overwrite:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.btn-overwrite:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .center-msg {

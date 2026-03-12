@@ -63,6 +63,24 @@ export function useLibrary() {
     });
   }
 
+  async function startOverwriteCatalogEntry(
+    taskId: string,
+    projectId: string,
+    websiteUrl: string,
+    zipUrl: string,
+    projectName: string,
+    maxProjectSizeMb: number,
+  ): Promise<string> {
+    return invoke<string>("start_overwrite_catalog_entry", {
+      taskId,
+      projectId,
+      websiteUrl,
+      zipUrl,
+      projectName,
+      maxProjectSizeMb,
+    });
+  }
+
   async function applyOversizeProjectAction(
     id: string,
     strategy: "keep-separate" | "compress" | "do-nothing",
@@ -179,6 +197,7 @@ export function useLibrary() {
     addProject,
     startDownloadProject,
     startDownloadCatalogEntry,
+    startOverwriteCatalogEntry,
     applyOversizeProjectAction,
     startApplyOversizeProjectAction,
     addProjectsBulk,

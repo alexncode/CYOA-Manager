@@ -33,6 +33,7 @@ pub fn run() {
             resolve_local_image_src,
             start_download_project,
             start_download_catalog_entry,
+            start_overwrite_catalog_entry,
             start_apply_oversize_project_action,
             remove_project,
             update_project,

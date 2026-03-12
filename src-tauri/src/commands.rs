@@ -7,6 +7,7 @@ use std::thread;
 
 use base64::Engine;
 use image::{DynamicImage, codecs::jpeg::JpegEncoder};
+use regex::Regex;
 use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
@@ -243,6 +244,59 @@ pub fn start_download_catalog_entry(
     Ok(task_id)
 }
 
+#[tauri::command]
+pub fn start_overwrite_catalog_entry(
+    app: tauri::AppHandle,
+    task_id: String,
+    project_id: String,
+    website_url: String,
+    zip_url: String,
+    project_name: String,
+    max_project_size_mb: u64,
+) -> Result<String, String> {
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Err("Missing task id".to_string());
+    }
+
+    let project_id = project_id.trim().to_string();
+    if project_id.is_empty() {
+        return Err("Missing project id".to_string());
+    }
+
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+    let limit_mb = max_project_size_mb.clamp(1, 2000);
+
+    thread::spawn(move || {
+        if let Err(error) = run_overwrite_catalog_entry(
+            &app_handle,
+            &task_id_for_thread,
+            &project_id,
+            website_url,
+            zip_url,
+            project_name,
+            limit_mb,
+        ) {
+            emit_catalog_import_progress(
+                app_handle,
+                CatalogImportProgress {
+                    task_id: task_id_for_thread,
+                    phase: "error".to_string(),
+                    current: 100,
+                    total: 100,
+                    message: "Catalog overwrite failed".to_string(),
+                    done: true,
+                    success: false,
+                    error: Some(error),
+                },
+            );
+        }
+    });
+
+    Ok(task_id)
+}
+
 fn run_download_project(
     app: &tauri::AppHandle,
     task_id: &str,
@@ -371,13 +425,12 @@ fn run_download_catalog_entry(
     let library = app.state::<LibraryState>();
     let desired_name = project_name.trim();
 
-    let mut project = match import_project_from_catalog_website(
+    let saved_project_path = match download_catalog_website_project(
         Some((app, task_id)),
         website_url.trim(),
         desired_name,
-        &library,
     ) {
-        Ok(project) => project,
+        Ok(path) => path,
         Err(error) => {
             emit_catalog_import_progress(
                 app.clone(),
@@ -393,33 +446,33 @@ fn run_download_catalog_entry(
                 },
             );
 
-            let extracted_project = download_catalog_project_zip(
+            download_catalog_project_zip(
                 zip_url.trim(),
                 desired_name,
                 Some((app, task_id)),
-            )?;
-
-            emit_catalog_import_progress(
-                app.clone(),
-                CatalogImportProgress {
-                    task_id: task_id.to_string(),
-                    phase: "importing-project".to_string(),
-                    current: 90,
-                    total: 100,
-                    message: format!("Adding {} to the library", desired_name),
-                    done: false,
-                    success: false,
-                    error: None,
-                },
-            );
-
-            add_project_from_path(
-                extracted_project.to_string_lossy().to_string(),
-                &library,
-                normalize_source_url(&website_url),
             )?
         }
     };
+
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "importing-project".to_string(),
+            current: 90,
+            total: 100,
+            message: format!("Adding {} to the library", desired_name),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let mut project = add_project_from_path(
+        saved_project_path.to_string_lossy().to_string(),
+        &library,
+        normalize_source_url(&website_url),
+    )?;
 
     apply_catalog_project_name_override(&mut project, desired_name, &library)?;
 
@@ -443,12 +496,119 @@ fn run_download_catalog_entry(
     Ok(())
 }
 
-fn import_project_from_catalog_website(
+fn run_overwrite_catalog_entry(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    project_id: &str,
+    website_url: String,
+    zip_url: String,
+    project_name: String,
+    max_project_size_mb: u64,
+) -> Result<(), String> {
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "trying-website".to_string(),
+            current: 0,
+            total: 100,
+            message: format!("Trying website link for {}", project_name.trim()),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let library = app.state::<LibraryState>();
+    let desired_name = project_name.trim();
+    let overwrite_destination = existing_project_file_path(project_id, &library);
+
+    let saved_project_path = match download_catalog_website_project_to_destination(
+        Some((app, task_id)),
+        website_url.trim(),
+        desired_name,
+        overwrite_destination.as_deref(),
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            emit_catalog_import_progress(
+                app.clone(),
+                CatalogImportProgress {
+                    task_id: task_id.to_string(),
+                    phase: "fallback-archive".to_string(),
+                    current: 20,
+                    total: 100,
+                    message: format!("Website link failed, falling back to ZIP: {}", error),
+                    done: false,
+                    success: false,
+                    error: None,
+                },
+            );
+
+            download_catalog_project_zip(
+                zip_url.trim(),
+                desired_name,
+                Some((app, task_id)),
+            )?
+        }
+    };
+
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "importing-project".to_string(),
+            current: 90,
+            total: 100,
+            message: format!("Overwriting {} in the library", desired_name),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let project = replace_project_from_path(
+        project_id,
+        saved_project_path.to_string_lossy().to_string(),
+        &library,
+        normalize_source_url(&website_url),
+        desired_name,
+    )?;
+
+    let max_project_size_bytes = max_project_size_mb.saturating_mul(1024 * 1024);
+    ensure_project_within_size_limit(&project.id, max_project_size_bytes, &library)?;
+
+    emit_catalog_import_progress(
+        app.clone(),
+        CatalogImportProgress {
+            task_id: task_id.to_string(),
+            phase: "done".to_string(),
+            current: 100,
+            total: 100,
+            message: format!("Overwrote {}", project.name),
+            done: true,
+            success: true,
+            error: None,
+        },
+    );
+
+    Ok(())
+}
+
+fn download_catalog_website_project(
     progress: Option<(&tauri::AppHandle, &str)>,
     website_url: &str,
     project_name: &str,
-    state: &State<LibraryState>,
-) -> Result<Project, String> {
+) -> Result<PathBuf, String> {
+    download_catalog_website_project_to_destination(progress, website_url, project_name, None)
+}
+
+fn download_catalog_website_project_to_destination(
+    progress: Option<(&tauri::AppHandle, &str)>,
+    website_url: &str,
+    project_name: &str,
+    destination_override: Option<&Path>,
+) -> Result<PathBuf, String> {
     let trimmed_url = website_url.trim();
     if trimmed_url.is_empty() {
         return Err("Missing website URL".to_string());
@@ -538,14 +698,12 @@ fn import_project_from_catalog_website(
         );
     }
 
-    let destination = unique_path(dir.join(download_file_name(&base_url)));
+    let destination = destination_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| unique_path(dir.join(download_file_name(&base_url))));
     std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
 
-    add_project_from_path(
-        destination.to_string_lossy().to_string(),
-        state,
-        normalize_source_url(website_url),
-    )
+    Ok(destination)
 }
 
 fn download_project_data(
@@ -564,23 +722,38 @@ fn download_project_data(
         return download_project_json_bytes(url, progress);
     }
 
-    let default_project_url = build_default_project_json_url(&url);
-    if let Ok(project) = download_project_json_bytes(default_project_url, progress) {
-        return Ok(project);
-    }
-
-    let (html, final_page_url) = fetch_html_page(url, "Failed to open website")?;
-
-    if let Some(project_url) = find_project_json_url_in_html(&html, &final_page_url) {
+    for project_url in candidate_project_json_urls(&url) {
         if let Ok(project) = download_project_json_bytes(project_url, progress) {
             return Ok(project);
         }
     }
 
-    if let Some((json, base_url)) = find_embedded_project_data(&html, &final_page_url)? {
-        let bytes = serde_json::to_vec(&json)
-            .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
-        return Ok((bytes, base_url));
+    let mut last_page_error = None;
+
+    for page_candidate in candidate_page_urls(&url) {
+        let (html, final_page_url) = match fetch_html_page(page_candidate, "Failed to open website") {
+            Ok(result) => result,
+            Err(error) => {
+                last_page_error = Some(error);
+                continue;
+            }
+        };
+
+        if let Some(project_url) = find_project_json_url_in_html(&html, &final_page_url) {
+            if let Ok(project) = download_project_json_bytes(project_url, progress) {
+                return Ok(project);
+            }
+        }
+
+        if let Some((json, base_url)) = find_embedded_project_data(&html, &final_page_url)? {
+            let bytes = serde_json::to_vec(&json)
+                .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
+            return Ok((bytes, base_url));
+        }
+    }
+
+    if let Some(error) = last_page_error {
+        return Err(error);
     }
 
     Err("Could not find project.json or embedded project data on the provided page".to_string())
@@ -772,12 +945,81 @@ fn fetch_html_page(url: tauri::Url, error_prefix: &str) -> Result<(String, tauri
     Ok((html, final_url))
 }
 
+fn candidate_page_urls(url: &tauri::Url) -> Vec<tauri::Url> {
+    let mut urls = vec![url.clone()];
+
+    if let Some(html_url) = build_extensionless_html_variant_url(url) {
+        if html_url != *url {
+            urls.push(html_url);
+        }
+    }
+
+    urls
+}
+
+fn candidate_project_json_urls(url: &tauri::Url) -> Vec<tauri::Url> {
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    let default_url = build_default_project_json_url(url);
+    if seen.insert(default_url.to_string()) {
+        urls.push(default_url);
+    }
+
+    if let Some(html_url) = build_extensionless_html_variant_url(url) {
+        let html_default_url = build_default_project_json_url(&html_url);
+        if seen.insert(html_default_url.to_string()) {
+            urls.push(html_default_url);
+        }
+    }
+
+    urls
+}
+
+fn build_extensionless_html_variant_url(url: &tauri::Url) -> Option<tauri::Url> {
+    let mut html_url = url.clone();
+    html_url.set_query(None);
+    html_url.set_fragment(None);
+
+    let path = html_url.path();
+    if path.is_empty() || path == "/" || path.ends_with('/') {
+        return None;
+    }
+
+    let last_segment = path.rsplit('/').next().unwrap_or_default();
+    if last_segment.is_empty() || last_segment.contains('.') {
+        return None;
+    }
+
+    html_url.set_path(&format!("{}.html", path));
+    Some(html_url)
+}
+
 fn find_embedded_project_data(
     html: &str,
     page_url: &tauri::Url,
 ) -> Result<Option<(serde_json::Value, tauri::Url)>, String> {
     for script in extract_inline_script_blocks(html) {
         if let Some(project) = extract_embedded_project_json(script) {
+            return Ok(Some((project, build_default_project_json_url(page_url))));
+        }
+    }
+
+    for script_url in find_hashed_app_script_urls_in_html(html, page_url) {
+        let response = match reqwest::blocking::get(script_url.clone()) {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let script = match response.text() {
+            Ok(script) => script,
+            Err(_) => continue,
+        };
+
+        if let Some(project) = extract_embedded_project_json(&script) {
             return Ok(Some((project, build_default_project_json_url(page_url))));
         }
     }
@@ -1322,6 +1564,45 @@ fn find_script_urls_in_html(html: &str, page_url: &tauri::Url) -> Vec<tauri::Url
     urls
 }
 
+fn find_hashed_app_script_urls_in_html(html: &str, page_url: &tauri::Url) -> Vec<tauri::Url> {
+    let script_src_regex = Regex::new(
+        r#"(?i)["'`](?P<src>(?:(?:https?:)?//|/|\.{1,2}/)?[^"'`\s]*?(?:js/)?app\.[A-Za-z0-9_-]+\.js(?:\?[^"'`\s]*)?)["'`]"#,
+    )
+    .expect("valid app script regex");
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    for captures in script_src_regex.captures_iter(html) {
+        let Some(src) = captures.name("src") else {
+            continue;
+        };
+
+        let decoded = decode_basic_html_entities(src.as_str()).replace("\\/", "/");
+        let normalized = strip_wrapping_url_quotes(decoded.trim());
+        let Some(url) = resolve_html_url_candidate(&normalized, page_url) else {
+            continue;
+        };
+
+        let key = url.as_str().to_ascii_lowercase();
+        if seen.insert(key) {
+            urls.push(url);
+        }
+    }
+
+    urls
+}
+
+fn resolve_html_url_candidate(candidate: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
+    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        tauri::Url::parse(candidate).ok()
+    } else if candidate.starts_with("//") {
+        tauri::Url::parse(&format!("{}:{}", page_url.scheme(), candidate)).ok()
+    } else {
+        page_url.join(candidate).ok()
+    }
+}
+
 fn script_url_priority(url: &tauri::Url) -> i32 {
     let path = url.path().to_ascii_lowercase();
     let mut score = 0;
@@ -1643,6 +1924,89 @@ fn add_project_from_path(
         eprintln!("Failed to update perk index after add: {}", error);
     }
     Ok(project)
+}
+
+fn replace_project_from_path(
+    project_id: &str,
+    file_path: String,
+    state: &State<LibraryState>,
+    source_url: Option<String>,
+    desired_name: &str,
+) -> Result<Project, String> {
+    let path = Path::new(&file_path);
+    if !path.exists() {
+        return Err(format!("File does not exist: {}", file_path));
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Not valid JSON: {}", e))?;
+
+    let filename_contains_project = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase().contains("project"))
+        .unwrap_or(false);
+
+    let derived_name = if filename_contains_project {
+        extract_first_row_title(&json)
+            .or_else(|| extract_project_name(&json))
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unnamed")
+                    .to_string()
+            })
+    } else {
+        extract_project_name(&json).unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Unnamed")
+                .to_string()
+        })
+    };
+
+    let cover_image = compress_cover_image_for_library(
+        &file_path,
+        extract_cover_image(&json).as_deref(),
+        LIBRARY_COVER_IMAGE_MAX_BYTES,
+    )?;
+    let detected_viewer_preference = detect_default_viewer_preference(&json);
+
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let project = lib
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .ok_or_else(|| format!("Project not found: {}", project_id))?;
+
+    project.name = if desired_name.trim().is_empty() {
+        derived_name
+    } else {
+        desired_name.trim().to_string()
+    };
+    project.cover_image = cover_image;
+    project.source_url = source_url;
+    project.file_path = file_path;
+    project.file_missing = false;
+    if project.viewer_preference.is_none() {
+        project.viewer_preference = detected_viewer_preference;
+    }
+
+    let updated = project.clone();
+    save_library(&lib)?;
+    if let Err(error) = sync_index_for_project_if_present(&updated) {
+        eprintln!("Failed to update perk index after overwrite: {}", error);
+    }
+    Ok(updated)
+}
+
+fn existing_project_file_path(project_id: &str, state: &State<LibraryState>) -> Option<PathBuf> {
+    let lib = state.lock().ok()?;
+    lib.projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .map(|project| PathBuf::from(&project.file_path))
 }
 
 fn normalize_source_url(raw: &str) -> Option<String> {
