@@ -39,6 +39,7 @@ pub fn run() {
             apply_oversize_project_action,
             get_project_json,
             scan_folder,
+            start_scan_folder,
             get_viewers,
             open_viewer_window,
             get_perk_index_status,

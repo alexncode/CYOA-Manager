@@ -32,7 +32,7 @@ watch(() => props.project, (project) => {
 async function pickCover() {
   const selected = await open({
     title: "Select cover image",
-    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
+    filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "avif"] }],
   });
   if (selected) cover.value = selected as string;
 }

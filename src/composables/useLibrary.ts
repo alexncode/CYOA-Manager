@@ -132,6 +132,10 @@ export function useLibrary() {
     return invoke<string[]>("scan_folder", { folder });
   }
 
+  async function startScanFolder(folder: string): Promise<string> {
+    return invoke<string>("start_scan_folder", { folder });
+  }
+
   async function getPerkIndexStatus(): Promise<PerkIndexStatus> {
     return invoke<PerkIndexStatus>("get_perk_index_status");
   }
@@ -184,6 +188,7 @@ export function useLibrary() {
     updateProject,
     openViewer,
     scanFolder,
+    startScanFolder,
     getPerkIndexStatus,
     startPerkIndexTask,
     syncPerkIndex,

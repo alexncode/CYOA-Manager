@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onBeforeUnmount, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLibrary } from "../composables/useLibrary";
 
 const emit = defineEmits<{
@@ -8,26 +9,107 @@ const emit = defineEmits<{
   (e: "close"): void;
 }>();
 
-const { scanFolder } = useLibrary();
+const { startScanFolder } = useLibrary();
 
 const discovered = ref<string[]>([]);
 const selected = ref<Set<string>>(new Set());
 const scanning = ref(false);
 const importing = ref(false);
 const progress = ref(0);
+const scanFound = ref(0);
+const scanScanned = ref(0);
+const scanStatus = ref("");
+const errorMsg = ref("");
 const step = ref<"pick" | "select" | "done">("pick");
+let unlisten: UnlistenFn | null = null;
+
+type BulkScanPayload = {
+  taskId: string;
+  scanned: number;
+  found: number;
+  message: string;
+  done: boolean;
+  success: boolean;
+  error?: string | null;
+  paths: string[];
+};
+
+onBeforeUnmount(() => {
+  if (unlisten) {
+    void unlisten();
+    unlisten = null;
+  }
+});
 
 async function pickFolder() {
   const folder = await open({ directory: true, title: "Select folder to scan" });
   if (!folder) return;
+
   scanning.value = true;
+  errorMsg.value = "";
+  discovered.value = [];
+  selected.value = new Set();
+  scanFound.value = 0;
+  scanScanned.value = 0;
+  scanStatus.value = "Preparing scan…";
+
   try {
-    discovered.value = await scanFolder(folder as string);
-    selected.value = new Set(discovered.value);
-    step.value = "select";
+    if (unlisten) {
+      await unlisten();
+      unlisten = null;
+    }
+
+    let taskId = "";
+    let pendingPayload: BulkScanPayload | null = null;
+
+    const applyPayload = async (payload: BulkScanPayload) => {
+      if (!taskId) {
+        pendingPayload = payload;
+        return;
+      }
+      if (payload.taskId !== taskId) {
+        return;
+      }
+
+      scanFound.value = payload.found;
+      scanScanned.value = payload.scanned;
+      scanStatus.value = payload.message;
+
+      if (!payload.done) {
+        return;
+      }
+
+      scanning.value = false;
+      if (unlisten) {
+        await unlisten();
+        unlisten = null;
+      }
+
+      if (!payload.success) {
+        errorMsg.value = payload.error || "Scan failed.";
+        scanStatus.value = "";
+        return;
+      }
+
+      discovered.value = payload.paths;
+      selected.value = new Set(payload.paths);
+      step.value = "select";
+    };
+
+    unlisten = await listen<BulkScanPayload>("bulk-scan-progress", async (event) => {
+      await applyPayload(event.payload);
+    });
+
+    taskId = await startScanFolder(folder as string);
+
+    if (pendingPayload) {
+      const bufferedPayload = pendingPayload;
+      pendingPayload = null;
+      await applyPayload(bufferedPayload);
+    }
   } catch (e) {
     console.error(e);
-  } finally {
+    errorMsg.value = String(e);
     scanning.value = false;
   }
 }
@@ -74,7 +156,10 @@ async function importSelected() {
 
       <!-- Step: pick folder -->
       <template v-if="step === 'pick'">
-        <p class="sub">Scan a folder for all <code>project.json</code> files.</p>
+        <p class="sub">Scan a folder for JSON files with a basic CYOA structure check.</p>
+        <p v-if="scanning" class="scan-status">{{ scanStatus || `Scanning… ${scanFound} found` }}</p>
+        <p v-if="scanning" class="scan-meta">Checked {{ scanScanned }} files, found {{ scanFound }} matches.</p>
+        <p v-if="errorMsg" class="error-text">{{ errorMsg }}</p>
         <div class="dialog-actions">
           <button class="btn-secondary" @click="emit('close')">Cancel</button>
           <button class="btn-primary" :disabled="scanning" @click="pickFolder">
@@ -106,7 +191,7 @@ async function importSelected() {
             />
             <span class="file-path">{{ path }}</span>
           </label>
-          <div v-if="!discovered.length" class="empty">No project.json files found.</div>
+          <div v-if="!discovered.length" class="empty">No matching project JSON files found.</div>
         </div>
 
         <div v-if="importing" class="progress-bar">
@@ -164,6 +249,9 @@ async function importSelected() {
 }
 h2 { margin: 0; }
 .sub { margin: 0; font-size: 0.9rem; color: var(--muted); }
+.scan-status { margin: 0; font-size: 0.95rem; color: var(--text); }
+.scan-meta { margin: 0; font-size: 0.85rem; color: var(--muted); }
+.error-text { margin: 0; font-size: 0.85rem; color: #d16a6a; }
 code { color: var(--accent); }
 .list-header {
   display: flex;

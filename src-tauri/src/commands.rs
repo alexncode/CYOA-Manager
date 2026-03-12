@@ -78,6 +78,19 @@ struct OversizeActionProgress {
     error: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkScanProgress {
+    task_id: String,
+    scanned: usize,
+    found: usize,
+    message: String,
+    done: bool,
+    success: bool,
+    error: Option<String>,
+    paths: Vec<String>,
+}
+
 // ─── Library CRUD ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1870,18 +1883,163 @@ pub fn get_project_json(id: String, state: State<LibraryState>) -> Result<String
 #[tauri::command]
 pub fn scan_folder(folder: String) -> Vec<String> {
     use walkdir::WalkDir;
+
     WalkDir::new(&folder)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_type().is_file()
-                && e.file_name()
-                    .to_str()
-                    .map(|n| n == "project.json")
-                    .unwrap_or(false)
+            e.file_type().is_file() && is_bulk_import_project_file(e.path())
         })
         .filter_map(|e| e.path().to_str().map(|s| s.to_string()))
         .collect()
+}
+
+#[tauri::command]
+pub fn start_scan_folder(app: tauri::AppHandle, folder: String) -> Result<String, String> {
+    let folder_path = PathBuf::from(&folder);
+    if !folder_path.exists() {
+        return Err(format!("Folder does not exist: {}", folder));
+    }
+    if !folder_path.is_dir() {
+        return Err(format!("Path is not a folder: {}", folder));
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let app_handle = app.clone();
+    let task_id_for_thread = task_id.clone();
+
+    thread::spawn(move || {
+        match scan_folder_with_progress(&app_handle, &task_id_for_thread, &folder_path) {
+            Ok((paths, scanned)) => emit_bulk_scan_progress(
+                app_handle,
+                BulkScanProgress {
+                    task_id: task_id_for_thread,
+                    scanned,
+                    found: paths.len(),
+                    message: format!("Scan complete. Found {} project files.", paths.len()),
+                    done: true,
+                    success: true,
+                    error: None,
+                    paths,
+                },
+            ),
+            Err(error) => emit_bulk_scan_progress(
+                app_handle,
+                BulkScanProgress {
+                    task_id: task_id_for_thread,
+                    scanned: 0,
+                    found: 0,
+                    message: "Scan failed.".to_string(),
+                    done: true,
+                    success: false,
+                    error: Some(error),
+                    paths: Vec::new(),
+                },
+            ),
+        }
+    });
+
+    Ok(task_id)
+}
+
+fn scan_folder_with_progress(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    folder: &Path,
+) -> Result<(Vec<String>, usize), String> {
+    use walkdir::WalkDir;
+
+    let mut discovered = Vec::new();
+    let mut scanned = 0usize;
+
+    emit_bulk_scan_progress(
+        app.clone(),
+        BulkScanProgress {
+            task_id: task_id.to_string(),
+            scanned,
+            found: discovered.len(),
+            message: "Scanning folder for project JSON files…".to_string(),
+            done: false,
+            success: false,
+            error: None,
+            paths: Vec::new(),
+        },
+    );
+
+    for entry in WalkDir::new(folder).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        scanned += 1;
+        let path = entry.path();
+
+        if is_bulk_import_project_file(path) {
+            if let Some(path_string) = path.to_str().map(|value| value.to_string()) {
+                discovered.push(path_string);
+            }
+
+            emit_bulk_scan_progress(
+                app.clone(),
+                BulkScanProgress {
+                    task_id: task_id.to_string(),
+                    scanned,
+                    found: discovered.len(),
+                    message: format!("Scanning… {} found", discovered.len()),
+                    done: false,
+                    success: false,
+                    error: None,
+                    paths: Vec::new(),
+                },
+            );
+            continue;
+        }
+
+        if scanned % 250 == 0 {
+            emit_bulk_scan_progress(
+                app.clone(),
+                BulkScanProgress {
+                    task_id: task_id.to_string(),
+                    scanned,
+                    found: discovered.len(),
+                    message: format!("Scanning… {} found", discovered.len()),
+                    done: false,
+                    success: false,
+                    error: None,
+                    paths: Vec::new(),
+                },
+            );
+        }
+    }
+
+    Ok((discovered, scanned))
+}
+
+fn is_bulk_import_project_file(path: &Path) -> bool {
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+
+    json.get("rows")
+        .and_then(|value| value.as_array())
+        .is_some()
 }
 
 // ─── Viewers ─────────────────────────────────────────────────────────────────
@@ -2238,12 +2396,18 @@ fn extension_for_mime(mime: &str) -> &'static str {
     let lower = mime.to_ascii_lowercase();
     if lower.contains("png") {
         "png"
+    } else if lower.contains("avif") {
+        "avif"
     } else if lower.contains("gif") {
         "gif"
     } else if lower.contains("webp") {
         "webp"
     } else if lower.contains("bmp") {
         "bmp"
+    } else if lower.contains("svg") {
+        "svg"
+    } else if lower.contains("tiff") || lower.contains("tif") {
+        "tiff"
     } else {
         "jpg"
     }
@@ -2516,6 +2680,10 @@ fn emit_catalog_import_progress(app: tauri::AppHandle, payload: CatalogImportPro
 
 fn emit_oversize_action_progress(app: tauri::AppHandle, payload: OversizeActionProgress) {
     let _ = app.emit("oversize-action-progress", payload);
+}
+
+fn emit_bulk_scan_progress(app: tauri::AppHandle, payload: BulkScanProgress) {
+    let _ = app.emit("bulk-scan-progress", payload);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
