@@ -5,27 +5,52 @@ mod perk_index;
 mod protocol;
 
 use commands::*;
-use library::load_library;
-use models::SessionStore;
+use library::{load_library, save_library};
+use models::{Library, SessionStore};
 use perk_index::*;
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let library = load_library();
+    let startup = load_library().unwrap_or_else(|error| {
+        eprintln!("Failed to load library storage: {}", error);
+        library::LibraryLoadResult {
+            library: Library::default(),
+            migration_notice: None,
+        }
+    });
+    let library = startup.library;
     let sessions: SessionStore = Mutex::new(HashMap::new());
+    let migration_notice: MigrationNoticeState = Mutex::new(startup.migration_notice);
+    let (library_save_tx, library_save_rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        while let Ok(mut snapshot) = library_save_rx.recv() {
+            while let Ok(newer_snapshot) = library_save_rx.try_recv() {
+                snapshot = newer_snapshot;
+            }
+
+            if let Err(error) = save_library(&snapshot) {
+                eprintln!("Failed to persist library snapshot: {}", error);
+            }
+        }
+    });
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(library))
         .manage(sessions)
+        .manage(migration_notice)
+        .manage(library_save_tx)
         .register_uri_scheme_protocol("cyoaview", |ctx, request| {
             protocol::handle(ctx.app_handle(), ctx.webview_label(), request)
         })
         .invoke_handler(tauri::generate_handler![
             get_library,
+            take_library_migration_notice,
             add_project,
             clear_library,
             compress_library_cover_images,
@@ -37,6 +62,7 @@ pub fn run() {
             start_apply_oversize_project_action,
             remove_project,
             update_project,
+            set_project_viewer_preference,
             apply_oversize_project_action,
             get_project_json,
             scan_folder,

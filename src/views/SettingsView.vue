@@ -76,12 +76,12 @@ async function onCompressLibraryCovers() {
       <label class="row">
         <span>Default viewer</span>
         <select v-model="settings.defaultViewer">
-          <option :value="null">None (show all buttons)</option>
+          <option :value="null">Automatic</option>
           <option v-for="v in viewers" :key="v.id" :value="v.id">{{ v.name }}</option>
         </select>
       </label>
       <p class="hint">
-        When set, only one "Open" button appears on each card using this viewer.
+        Used as the initial viewer selection. 
       </p>
       <label class="row checkbox-row">
         <span>Cheats</span>

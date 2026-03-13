@@ -3,6 +3,7 @@ import { computed, onMounted } from "vue";
 import { RouterView, RouterLink } from "vue-router";
 import { useSettings } from "./composables/useSettings";
 import { useLibrary } from "./composables/useLibrary";
+import { resolveViewerId } from "./viewers";
 
 const { settings, applyTheme } = useSettings();
 const { projects, viewers, loadLibrary, loadViewers, openViewer } = useLibrary();
@@ -29,9 +30,11 @@ async function openRandomProject() {
 
   const candidates = randomCandidates.value;
   const project = candidates[Math.floor(Math.random() * candidates.length)];
-  const viewerId = project.viewer_preference
-    || settings.value.defaultViewer
-    || viewers.value[0]?.id;
+  const viewerId = resolveViewerId(
+    viewers.value,
+    project.viewer_preference,
+    settings.value.defaultViewer,
+  );
 
   if (!viewerId) {
     return;

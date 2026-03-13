@@ -3,6 +3,7 @@ import { ref, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Project, Viewer } from "../types";
+import { resolveViewerId } from "../viewers";
 
 const props = defineProps<{
   project: Project;
@@ -21,6 +22,7 @@ const menuOpen = ref(false);
 const imageFailed = ref(false);
 const coverImageSrc = ref<string | null>(null);
 const openingSource = ref(false);
+const selectedViewerId = ref<string | null>(null);
 
 const initials = computed(() => {
   const words = props.project.name.trim().split(/\s+/);
@@ -36,9 +38,8 @@ const coverColor = computed(() => {
   return `hsl(${hue}, 40%, 35%)`;
 });
 
-const preferredViewer = computed(() => {
-  const preferredId = props.project.viewer_preference || props.defaultViewer;
-  return props.viewers.find((viewer) => viewer.id === preferredId) ?? null;
+const selectedViewer = computed(() => {
+  return props.viewers.find((viewer) => viewer.id === selectedViewerId.value) ?? null;
 });
 
 const sourceUrl = computed(() => {
@@ -59,6 +60,23 @@ watch(
     } catch {
       coverImageSrc.value = null;
     }
+  },
+  { immediate: true }
+);
+
+watch(
+  () => [
+    props.project.id,
+    props.project.viewer_preference,
+    props.defaultViewer,
+    props.viewers.map((viewer) => viewer.id).join("|"),
+  ],
+  () => {
+    selectedViewerId.value = resolveViewerId(
+      props.viewers,
+      props.project.viewer_preference,
+      props.defaultViewer,
+    );
   },
   { immediate: true }
 );
@@ -145,29 +163,21 @@ async function onOpenSource() {
         <span v-for="tag in project.tags" :key="tag" class="tag">{{ tag }}</span>
       </div>
 
-      <!-- Open buttons -->
+      <!-- Open action -->
       <div class="actions">
         <template v-if="viewers.length === 0">
           <span class="no-viewers">No viewers found</span>
         </template>
-        <template v-else-if="viewers.length === 1 || preferredViewer">
+        <template v-else>
+          <select v-model="selectedViewerId" class="viewer-select">
+            <option v-for="v in viewers" :key="v.id" :value="v.id">{{ v.name }}</option>
+          </select>
           <button
             class="btn-open"
-            :disabled="project.file_missing"
-            @click="onOpen(preferredViewer ? preferredViewer.id : viewers[0].id)"
+            :disabled="project.file_missing || !selectedViewer"
+            @click="selectedViewer && onOpen(selectedViewer.id)"
           >
             Open
-          </button>
-        </template>
-        <template v-else>
-          <button
-            v-for="v in viewers"
-            :key="v.id"
-            class="btn-open"
-            :disabled="project.file_missing"
-            @click="onOpen(v.id)"
-          >
-            {{ v.name }}
           </button>
         </template>
       </div>
@@ -338,11 +348,26 @@ async function onOpenSource() {
 .actions {
   margin-top: auto;
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
 }
+.viewer-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 10px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8rem;
+  outline: none;
+}
+.viewer-select:focus {
+  border-color: var(--accent);
+}
 .btn-open {
-  flex: 1;
+  flex: 0 0 auto;
+  min-width: 72px;
   padding: 5px 10px;
   background: var(--accent);
   color: #fff;

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
@@ -12,11 +13,13 @@ use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
 
-use crate::library::{cyoas_dir, load_library as reload_from_disk, save_library};
+use crate::library::{cyoas_dir, reload_library, save_library};
 use crate::models::{Library, Project, ProjectPatch, SessionStore, Viewer, ViewerSession};
 use crate::perk_index::{clear_index_if_present, remove_project_from_index_if_present, sync_index_for_project_if_present};
 
 pub type LibraryState = Mutex<Library>;
+pub type LibrarySaveSender = Sender<Library>;
+pub type MigrationNoticeState = Mutex<Option<String>>;
 const LIBRARY_COVER_IMAGE_MAX_BYTES: usize = 60 * 1024;
 
 #[derive(Clone, Copy)]
@@ -101,6 +104,14 @@ pub fn get_library(state: State<LibraryState>) -> Result<Vec<Project>, String> {
         project.file_missing = !Path::new(&project.file_path).exists();
     }
     Ok(lib.projects.clone())
+}
+
+#[tauri::command]
+pub fn take_library_migration_notice(
+    state: State<MigrationNoticeState>,
+) -> Result<Option<String>, String> {
+    let mut notice = state.lock().map_err(|e| e.to_string())?;
+    Ok(notice.take())
 }
 
 #[tauri::command]
@@ -2108,6 +2119,38 @@ pub fn update_project(
 }
 
 #[tauri::command]
+pub fn set_project_viewer_preference(
+    id: String,
+    viewer_preference: String,
+    state: State<LibraryState>,
+    save_queue: State<LibrarySaveSender>,
+) -> Result<Project, String> {
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let project = lib
+        .projects
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("Project not found: {}", id))?;
+
+    let trimmed = viewer_preference.trim();
+    project.viewer_preference = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+
+    let updated = project.clone();
+    let snapshot = lib.clone();
+    drop(lib);
+
+    save_queue
+        .send(snapshot)
+        .map_err(|error| format!("Failed to queue library save: {}", error))?;
+
+    Ok(updated)
+}
+
+#[tauri::command]
 pub fn start_apply_oversize_project_action(
     app: tauri::AppHandle,
     id: String,
@@ -3224,7 +3267,9 @@ pub fn sync_library(state: &State<LibraryState>) {
     if let Ok(fresh) = state.lock() {
         drop(fresh); // release before reload
     }
-    let fresh = reload_from_disk();
+    let Ok(fresh) = reload_library() else {
+        return;
+    };
     if let Ok(mut lib) = state.lock() {
         *lib = fresh;
     }

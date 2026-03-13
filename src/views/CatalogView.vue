@@ -355,7 +355,7 @@ async function downloadCatalogEntry(
       await clearCatalogDownloadListeners();
 
       if (success) {
-        await loadLibrary();
+        await loadLibrary(true);
         if (showSuccessBanner && message) {
           successMessage.value = message;
         }
@@ -579,7 +579,7 @@ async function chooseOversizeOption(strategy: OversizeActionStrategy): Promise<b
         }
 
         if (payload.success) {
-          await loadLibrary();
+          await loadLibrary(true);
           showOversizePrompt.value = false;
           successMessage.value = "Oversize project handling applied.";
           resolve(true);

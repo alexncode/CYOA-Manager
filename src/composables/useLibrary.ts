@@ -7,20 +7,40 @@ const projects = ref<Project[]>([]);
 const viewers = ref<Viewer[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
+let libraryLoaded = false;
+let libraryLoadPromise: Promise<void> | null = null;
 
 export function useLibrary() {
   const { settings } = useSettings();
 
-  async function loadLibrary() {
-    try {
-      loading.value = true;
-      error.value = null;
-      projects.value = await invoke<Project[]>("get_library");
-    } catch (e: any) {
-      error.value = String(e);
-    } finally {
-      loading.value = false;
+  async function loadLibrary(force = false) {
+    if (!force && libraryLoaded) {
+      return;
     }
+
+    if (!force && libraryLoadPromise) {
+      return libraryLoadPromise;
+    }
+
+    libraryLoadPromise = (async () => {
+      try {
+        loading.value = true;
+        error.value = null;
+        projects.value = await invoke<Project[]>("get_library");
+        libraryLoaded = true;
+      } catch (e: any) {
+        error.value = String(e);
+      } finally {
+        loading.value = false;
+        libraryLoadPromise = null;
+      }
+    })();
+
+    return libraryLoadPromise;
+  }
+
+  async function takeLibraryMigrationNotice(): Promise<string | null> {
+    return invoke<string | null>("take_library_migration_notice");
   }
 
   async function loadViewers() {
@@ -117,12 +137,13 @@ export function useLibrary() {
   async function clearLibrary() {
     await invoke("clear_library");
     projects.value = [];
+    libraryLoaded = true;
   }
 
   async function compressLibraryCoverImages(): Promise<number> {
     const changed = await invoke<number>("compress_library_cover_images");
     if (changed > 0) {
-      await loadLibrary();
+      await loadLibrary(true);
     }
     return changed;
   }
@@ -134,16 +155,35 @@ export function useLibrary() {
     return updated;
   }
 
-  async function openViewer(project: Project, viewerId: string) {
-    if (project.viewer_preference !== viewerId) {
-      project = await updateProject(project.id, { viewer_preference: viewerId });
+  function setProjectViewerPreferenceLocally(id: string, viewerId: string) {
+    const idx = projects.value.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      return;
     }
+
+    projects.value[idx] = {
+      ...projects.value[idx],
+      viewer_preference: viewerId,
+    };
+  }
+
+  async function openViewer(project: Project, viewerId: string) {
     await invoke("open_viewer_window", {
       projectId: project.id,
       viewerId,
       projectName: project.name,
       cheatsEnabled: settings.value.cheatsEnabled,
     });
+
+    if (project.viewer_preference !== viewerId) {
+      setProjectViewerPreferenceLocally(project.id, viewerId);
+      void invoke<Project>("set_project_viewer_preference", {
+        id: project.id,
+        viewerPreference: viewerId,
+      }).catch((error) => {
+        console.error("Failed to save project viewer preference:", error);
+      });
+    }
   }
 
   async function scanFolder(folder: string): Promise<string[]> {
@@ -193,6 +233,7 @@ export function useLibrary() {
     loading,
     error,
     loadLibrary,
+    takeLibraryMigrationNotice,
     loadViewers,
     addProject,
     startDownloadProject,

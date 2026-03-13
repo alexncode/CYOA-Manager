@@ -16,6 +16,7 @@ const {
   loading,
   error,
   loadLibrary,
+  takeLibraryMigrationNotice,
   removeProject,
   updateProject,
   openViewer,
@@ -33,6 +34,7 @@ const showBulk = ref(false);
 const showDownload = ref(false);
 const editTarget = ref<Project | null>(null);
 const relinkTarget = ref<Project | null>(null);
+const migrationNotice = ref<string | null>(null);
 
 const displayedList = computed(() => {
   let list = [...projects.value];
@@ -59,7 +61,16 @@ const displayedList = computed(() => {
 
 onMounted(async () => {
   await loadLibrary();
+  migrationNotice.value = await takeLibraryMigrationNotice();
 });
+
+async function reloadLibrary() {
+  await loadLibrary(true);
+}
+
+function closeMigrationNotice() {
+  migrationNotice.value = null;
+}
 
 async function onRemove(project: Project) {
   if (!confirm(`Remove "${project.name}" from library?`)) return;
@@ -155,17 +166,17 @@ async function onOpen(project: Project, viewerId: string) {
   <AddProjectDialog
     v-if="showAdd"
     @close="showAdd = false"
-    @added="loadLibrary"
+    @added="reloadLibrary"
   />
   <BulkImportDialog
     v-if="showBulk"
     @close="showBulk = false"
-    @added="loadLibrary"
+    @added="reloadLibrary"
   />
   <DownloadProjectDialog
     v-if="showDownload"
     @close="showDownload = false"
-    @added="loadLibrary"
+    @added="reloadLibrary"
   />
   <EditProjectDialog
     v-if="editTarget"
@@ -180,6 +191,16 @@ async function onOpen(project: Project, viewerId: string) {
     @save="(patch) => onRelink(relinkTarget!, patch)"
     @close="relinkTarget = null"
   />
+
+  <div v-if="migrationNotice" class="overlay" @click.self="closeMigrationNotice">
+    <div class="dialog migration-dialog">
+      <h2>Library Migrated</h2>
+      <p>{{ migrationNotice }}</p>
+      <div class="dialog-actions">
+        <button class="btn-primary" @click="closeMigrationNotice">OK</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -275,4 +296,39 @@ async function onOpen(project: Project, viewerId: string) {
   justify-content: center;
 }
 .btn-primary.large { padding: 12px 28px; font-size: 1rem; margin-top: 8px; }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.dialog {
+  width: min(480px, calc(100vw - 32px));
+  background: var(--dialog-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+}
+
+.migration-dialog h2 {
+  margin: 0 0 10px;
+}
+
+.migration-dialog p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
 </style>
