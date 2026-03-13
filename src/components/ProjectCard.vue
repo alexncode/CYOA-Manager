@@ -9,6 +9,8 @@ const props = defineProps<{
   project: Project;
   viewers: Viewer[];
   defaultViewer: string | null;
+  redownloadBusy?: boolean;
+  redownloadLabel?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -16,12 +18,14 @@ const emit = defineEmits<{
   (e: "remove"): void;
   (e: "edit"): void;
   (e: "relink"): void;
+  (e: "redownload"): Promise<void> | void;
 }>();
 
 const menuOpen = ref(false);
 const imageFailed = ref(false);
 const coverImageSrc = ref<string | null>(null);
 const openingSource = ref(false);
+const redownloading = ref(false);
 const selectedViewerId = ref<string | null>(null);
 
 const initials = computed(() => {
@@ -45,6 +49,15 @@ const selectedViewer = computed(() => {
 const sourceUrl = computed(() => {
   const raw = props.project.source_url;
   return raw && raw.trim() ? raw : null;
+});
+
+const isRedownloading = computed(() => redownloading.value || Boolean(props.redownloadBusy));
+const redownloadText = computed(() => {
+  if (!isRedownloading.value) {
+    return "Re-download";
+  }
+
+  return props.redownloadLabel?.trim() || "Re-downloading...";
 });
 
 watch(
@@ -112,6 +125,19 @@ async function onOpenSource() {
     openingSource.value = false;
   }
 }
+
+async function onRedownload() {
+  if (!sourceUrl.value || isRedownloading.value) {
+    return;
+  }
+
+  redownloading.value = true;
+  try {
+    await emit("redownload");
+  } finally {
+    redownloading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -131,14 +157,23 @@ async function onOpenSource() {
       />
       <span v-else class="initials">{{ initials }}</span>
 
-      <button
-        v-if="sourceUrl"
-        class="source-btn"
-        :disabled="openingSource"
-        @click.stop="onOpenSource"
-      >
-        Open Source
-      </button>
+      <div v-if="sourceUrl" class="source-actions">
+        <button
+          class="source-btn"
+          :disabled="openingSource || isRedownloading"
+          @click.stop="onOpenSource"
+        >
+          Open Source
+        </button>
+        <button
+          class="source-btn secondary"
+          :class="{ busy: isRedownloading }"
+          :disabled="isRedownloading || openingSource"
+          @click.stop="onRedownload"
+        >
+          {{ redownloadText }}
+        </button>
+      </div>
 
       <div v-if="project.file_missing" class="badge missing-badge">File missing</div>
 
@@ -241,10 +276,16 @@ async function onOpenSource() {
   color: #fff;
 }
 
-.source-btn {
+.source-actions {
   position: absolute;
   top: 6px;
   left: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.source-btn {
   padding: 6px 10px;
   background: rgba(0, 0, 0, 0.68);
   border: none;
@@ -259,6 +300,14 @@ async function onOpenSource() {
 
 .card:hover .source-btn {
   opacity: 1;
+}
+
+.source-btn.secondary {
+  background: rgba(0, 0, 0, 0.56);
+}
+
+.source-btn.busy {
+  background: rgba(18, 122, 96, 0.78);
 }
 
 .source-btn:hover:not(:disabled) {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLibrary } from "../composables/useLibrary";
 import { useSettings } from "../composables/useSettings";
 import ProjectCard from "../components/ProjectCard.vue";
@@ -18,6 +19,7 @@ const {
   loadLibrary,
   takeLibraryMigrationNotice,
   removeProject,
+  startOverwriteCatalogEntry,
   updateProject,
   openViewer,
   allTags,
@@ -35,6 +37,21 @@ const showDownload = ref(false);
 const editTarget = ref<Project | null>(null);
 const relinkTarget = ref<Project | null>(null);
 const migrationNotice = ref<string | null>(null);
+const redownloadingProjectId = ref<string | null>(null);
+const redownloadStatus = ref<string | null>(null);
+let redownloadProgressUnlisten: UnlistenFn | null = null;
+let activeRedownloadTaskId = "";
+
+type CatalogProgressPayload = {
+  taskId: string;
+  phase: string;
+  current: number;
+  total: number;
+  message: string;
+  done: boolean;
+  success: boolean;
+  error?: string | null;
+};
 
 const displayedList = computed(() => {
   let list = [...projects.value];
@@ -72,6 +89,15 @@ function closeMigrationNotice() {
   migrationNotice.value = null;
 }
 
+async function clearRedownloadListener() {
+  if (!redownloadProgressUnlisten) {
+    return;
+  }
+
+  await redownloadProgressUnlisten();
+  redownloadProgressUnlisten = null;
+}
+
 async function onRemove(project: Project) {
   if (!confirm(`Remove "${project.name}" from library?`)) return;
   await removeProject(project.id);
@@ -89,6 +115,68 @@ async function onRelink(project: Project, patch: ProjectPatch) {
 
 async function onOpen(project: Project, viewerId: string) {
   await openViewer(project, viewerId);
+}
+
+async function onRedownload(project: Project) {
+  if (!project.source_url || !project.source_url.trim()) {
+    return;
+  }
+
+  if (activeRedownloadTaskId) {
+    alert("A re-download is already in progress.");
+    return;
+  }
+
+  const taskId = crypto.randomUUID();
+  activeRedownloadTaskId = taskId;
+  redownloadingProjectId.value = project.id;
+  redownloadStatus.value = "Preparing...";
+
+  await clearRedownloadListener();
+
+  try {
+    redownloadProgressUnlisten = await listen<CatalogProgressPayload>("download-catalog-progress", async (event) => {
+      const payload = event.payload;
+      if (payload.taskId !== activeRedownloadTaskId) {
+        return;
+      }
+
+      redownloadStatus.value = payload.message;
+
+      if (!payload.done) {
+        return;
+      }
+
+      activeRedownloadTaskId = "";
+      redownloadingProjectId.value = null;
+      await clearRedownloadListener();
+
+      if (payload.success) {
+        redownloadStatus.value = null;
+        await loadLibrary(true);
+        return;
+      }
+
+      const message = payload.error || payload.message || "Re-download failed.";
+      redownloadStatus.value = null;
+      alert(message);
+    });
+
+    await startOverwriteCatalogEntry(
+      taskId,
+      project.id,
+      project.source_url,
+      "",
+      project.name,
+      settings.value.downloadSizeLimitMb,
+    );
+  } catch (redownloadError) {
+    activeRedownloadTaskId = "";
+    redownloadingProjectId.value = null;
+    redownloadStatus.value = null;
+    await clearRedownloadListener();
+    alert(redownloadError instanceof Error ? redownloadError.message : String(redownloadError));
+  }
 }
 
 </script>
@@ -154,7 +242,10 @@ async function onOpen(project: Project, viewerId: string) {
         :project="p"
         :viewers="viewers"
         :default-viewer="settings.defaultViewer"
+        :redownload-busy="redownloadingProjectId === p.id"
+        :redownload-label="redownloadingProjectId === p.id ? redownloadStatus : null"
         @open="(vid) => onOpen(p, vid)"
+        @redownload="onRedownload(p)"
         @remove="onRemove(p)"
         @edit="editTarget = p"
         @relink="relinkTarget = p"
