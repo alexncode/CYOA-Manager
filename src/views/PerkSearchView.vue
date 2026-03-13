@@ -4,9 +4,12 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import PerkCard from "../components/PerkCard.vue";
 import ProgressBar from "../components/ProgressBar.vue";
 import { useLibrary } from "../composables/useLibrary";
+import { useSettings } from "../composables/useSettings";
 import type { PerkIndexStatus, PerkSearchResult } from "../types";
+import { resolveViewerId } from "../viewers";
 
-const { projects, getPerkIndexStatus, startPerkIndexTask, searchPerks } = useLibrary();
+const { projects, viewers, loadViewers, getPerkIndexStatus, startPerkIndexTask, searchPerks, openViewer } = useLibrary();
+const { settings } = useSettings();
 
 const query = ref("");
 const results = ref<PerkSearchResult[]>([]);
@@ -26,6 +29,8 @@ const sentinelRef = useTemplateRef<HTMLElement>("sentinelRef");
 const pageSize = 60;
 let indexProgressUnlisten: UnlistenFn | null = null;
 let infiniteScrollObserver: IntersectionObserver | null = null;
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let searchRequestId = 0;
 
 type PerkIndexProgressPayload = {
   taskId: string;
@@ -39,10 +44,13 @@ type PerkIndexProgressPayload = {
   status?: PerkIndexStatus | null;
 };
 
-const canSearch = computed(() => Boolean(status.value?.ready) && projects.value.length > 0);
 const resultCountLabel = computed(() => {
   if (!status.value?.ready || indexing.value) {
     return "";
+  }
+
+  if (query.value.trim().length > 0 && query.value.trim().length < 3) {
+    return "Type at least 3 characters";
   }
 
   if (loading.value && results.value.length === 0) {
@@ -61,10 +69,16 @@ const resultCountLabel = computed(() => {
 });
 
 onMounted(async () => {
+  await loadViewers();
   await initializeIndex();
 });
 
 onBeforeUnmount(async () => {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+
   if (indexProgressUnlisten) {
     await indexProgressUnlisten();
     indexProgressUnlisten = null;
@@ -79,9 +93,10 @@ async function initializeIndex() {
     status.value = await getPerkIndexStatus();
     if (!status.value.ready || status.value.needsReindex) {
       openImagePrompt(false);
-    } else {
-      await runSearch(true);
+      return;
     }
+
+    await runSearch(true);
   } catch (cause: any) {
     error.value = String(cause);
   }
@@ -157,20 +172,61 @@ async function runSearch(reset: boolean) {
     return;
   }
 
+  const trimmedQuery = query.value.trim();
+  const requestId = ++searchRequestId;
+  if (trimmedQuery.length > 0 && trimmedQuery.length < 3) {
+    results.value = [];
+    hasMore.value = false;
+    loading.value = false;
+    return;
+  }
+
   loading.value = true;
   error.value = null;
   try {
     const offset = reset ? 0 : results.value.length;
-    const next = await searchPerks(query.value, pageSize, offset);
+    const next = await searchPerks(trimmedQuery, pageSize, offset);
+    if (requestId !== searchRequestId) {
+      return;
+    }
+
     results.value = reset ? next : [...results.value, ...next];
     hasMore.value = next.length === pageSize;
     await nextTick();
     setupInfiniteScroll();
   } catch (cause: any) {
+    if (requestId !== searchRequestId) {
+      return;
+    }
+
     error.value = String(cause);
   } finally {
-    loading.value = false;
+    if (requestId === searchRequestId) {
+      loading.value = false;
+    }
   }
+}
+
+async function openPerkProject(projectId: string) {
+  const project = projects.value.find((entry) => entry.id === projectId);
+  if (!project || project.file_missing) {
+    return;
+  }
+
+  if (viewers.value.length === 0) {
+    await loadViewers();
+  }
+
+  const viewerId = resolveViewerId(
+    viewers.value,
+    project.viewer_preference,
+    settings.value.defaultViewer,
+  );
+  if (!viewerId) {
+    return;
+  }
+
+  await openViewer(project, viewerId);
 }
 
 async function rebuild(includeImages: boolean) {
@@ -213,6 +269,28 @@ watch(
     setupInfiniteScroll();
   },
 );
+
+watch(
+  () => query.value,
+  () => {
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+    }
+
+    const trimmedQuery = query.value.trim();
+    if (trimmedQuery.length > 0 && trimmedQuery.length < 3) {
+      results.value = [];
+      hasMore.value = false;
+      loading.value = false;
+      return;
+    }
+
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      void runSearch(true);
+    }, 300);
+  },
+);
 </script>
 
 <template>
@@ -224,11 +302,7 @@ watch(
         type="text"
         placeholder="Search perk title, description, addons, row"
         :disabled="indexing"
-        @keydown.enter="runSearch(true)"
       />
-      <button class="btn-primary" :disabled="indexing || !canSearch" @click="runSearch(true)">
-        Search
-      </button>
       <span v-if="resultCountLabel" class="result-count">{{ resultCountLabel }}</span>
       <button class="btn-secondary" :disabled="indexing || projects.length === 0" @click="openImagePrompt(false)">
         Sync Index
@@ -265,12 +339,20 @@ watch(
     <div v-else-if="!status?.ready" class="center-msg">
       The perk index is not ready yet.
     </div>
+    <div v-else-if="query.trim().length > 0 && query.trim().length < 3" class="center-msg">
+      Type at least 3 characters to search perks.
+    </div>
     <div v-else-if="results.length === 0 && !loading" class="center-msg">
       No perks matched this search.
     </div>
     <div v-else ref="resultsWrapRef" class="results-wrap">
       <div class="results-grid">
-        <PerkCard v-for="perk in results" :key="`${perk.projectId}-${perk.objectId}-${perk.rowId}`" :perk="perk" />
+        <PerkCard
+          v-for="perk in results"
+          :key="`${perk.projectId}-${perk.objectId}-${perk.rowId}`"
+          :perk="perk"
+          @open-project="openPerkProject"
+        />
       </div>
       <div ref="sentinelRef" class="results-sentinel" aria-hidden="true">
         <span v-if="loading && results.length > 0" class="results-loading">Loading more perks...</span>

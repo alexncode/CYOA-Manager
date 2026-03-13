@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
@@ -13,12 +12,21 @@ use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 use chrono::Utc;
 
-use crate::library::{cyoas_dir, reload_library, save_library};
+use crate::library::{
+    clear_projects as clear_library_storage,
+    cyoas_dir,
+    delete_project as delete_library_project,
+    insert_project as insert_library_project,
+    reload_library,
+    set_project_favorite as persist_project_favorite,
+    set_project_viewer_preference as persist_project_viewer_preference,
+    update_project as persist_project,
+    update_projects as persist_projects,
+};
 use crate::models::{Library, Project, ProjectPatch, SessionStore, Viewer, ViewerSession};
 use crate::perk_index::{clear_index_if_present, remove_project_from_index_if_present, sync_index_for_project_if_present};
 
 pub type LibraryState = Mutex<Library>;
-pub type LibrarySaveSender = Sender<Library>;
 pub type MigrationNoticeState = Mutex<Option<String>>;
 const LIBRARY_COVER_IMAGE_MAX_BYTES: usize = 60 * 1024;
 
@@ -155,8 +163,9 @@ pub fn resolve_local_image_src(image_path: String) -> Result<Option<String>, Str
 pub fn compress_library_cover_images(state: State<LibraryState>) -> Result<usize, String> {
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     let mut changed = 0usize;
+    let mut updated_projects = Vec::new();
 
-    for project in lib.projects.iter_mut() {
+    for project in &lib.projects {
         let next_cover_image = compress_cover_image_for_library(
             &project.file_path,
             project.cover_image.as_deref(),
@@ -164,13 +173,21 @@ pub fn compress_library_cover_images(state: State<LibraryState>) -> Result<usize
         )?;
 
         if next_cover_image != project.cover_image {
-            project.cover_image = next_cover_image;
+            let mut updated = project.clone();
+            updated.cover_image = next_cover_image;
+            updated_projects.push(updated);
             changed += 1;
         }
     }
 
     if changed > 0 {
-        save_library(&lib)?;
+        persist_projects(&updated_projects)?;
+
+        for updated in updated_projects {
+            if let Some(project) = lib.projects.iter_mut().find(|project| project.id == updated.id) {
+                *project = updated;
+            }
+        }
     }
 
     Ok(changed)
@@ -1067,14 +1084,18 @@ fn apply_catalog_project_name_override(
     }
 
     let mut lib = state.lock().map_err(|e| e.to_string())?;
-    let stored = lib
+    let index = lib
         .projects
-        .iter_mut()
-        .find(|candidate| candidate.id == project.id)
+        .iter()
+        .position(|candidate| candidate.id == project.id)
         .ok_or_else(|| format!("Project not found after import: {}", project.id))?;
-    stored.name = desired_name.to_string();
-    project.name = stored.name.clone();
-    save_library(&lib)?;
+
+    let mut updated = lib.projects[index].clone();
+    updated.name = desired_name.to_string();
+    persist_project(&updated)?;
+
+    lib.projects[index] = updated.clone();
+    project.name = updated.name;
     Ok(())
 }
 
@@ -1923,14 +1944,16 @@ fn add_project_from_path(
         source_url,
         file_path,
         viewer_preference,
+        favorite: false,
         date_added: Utc::now().to_rfc3339(),
         tags: Vec::new(),
         file_missing: false,
     };
 
+    insert_library_project(&project)?;
+
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.push(project.clone());
-    save_library(&lib)?;
     if let Err(error) = sync_index_for_project_if_present(&project) {
         eprintln!("Failed to update perk index after add: {}", error);
     }
@@ -1985,27 +2008,28 @@ fn replace_project_from_path(
     let detected_viewer_preference = detect_default_viewer_preference(&json);
 
     let mut lib = state.lock().map_err(|e| e.to_string())?;
-    let project = lib
+    let index = lib
         .projects
-        .iter_mut()
-        .find(|p| p.id == project_id)
+        .iter()
+        .position(|p| p.id == project_id)
         .ok_or_else(|| format!("Project not found: {}", project_id))?;
 
-    project.name = if desired_name.trim().is_empty() {
+    let mut updated = lib.projects[index].clone();
+    updated.name = if desired_name.trim().is_empty() {
         derived_name
     } else {
         desired_name.trim().to_string()
     };
-    project.cover_image = cover_image;
-    project.source_url = source_url;
-    project.file_path = file_path;
-    project.file_missing = false;
-    if project.viewer_preference.is_none() {
-        project.viewer_preference = detected_viewer_preference;
+    updated.cover_image = cover_image;
+    updated.source_url = source_url;
+    updated.file_path = file_path;
+    updated.file_missing = false;
+    if updated.viewer_preference.is_none() {
+        updated.viewer_preference = detected_viewer_preference;
     }
 
-    let updated = project.clone();
-    save_library(&lib)?;
+    persist_project(&updated)?;
+    lib.projects[index] = updated.clone();
     if let Err(error) = sync_index_for_project_if_present(&updated) {
         eprintln!("Failed to update perk index after overwrite: {}", error);
     }
@@ -2053,9 +2077,10 @@ fn normalize_source_url(raw: &str) -> Option<String> {
 
 #[tauri::command]
 pub fn remove_project(id: String, state: State<LibraryState>) -> Result<(), String> {
+    delete_library_project(&id)?;
+
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.retain(|p| p.id != id);
-    save_library(&lib)?;
     if let Err(error) = remove_project_from_index_if_present(&id) {
         eprintln!("Failed to update perk index after removal: {}", error);
     }
@@ -2064,9 +2089,10 @@ pub fn remove_project(id: String, state: State<LibraryState>) -> Result<(), Stri
 
 #[tauri::command]
 pub fn clear_library(state: State<LibraryState>) -> Result<(), String> {
+    clear_library_storage()?;
+
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     lib.projects.clear();
-    save_library(&lib)?;
     if let Err(error) = clear_index_if_present() {
         eprintln!("Failed to clear perk index: {}", error);
     }
@@ -2080,38 +2106,43 @@ pub fn update_project(
     state: State<LibraryState>,
 ) -> Result<Project, String> {
     let mut lib = state.lock().map_err(|e| e.to_string())?;
-    let project = lib
+    let index = lib
         .projects
-        .iter_mut()
-        .find(|p| p.id == id)
+        .iter()
+        .position(|p| p.id == id)
         .ok_or_else(|| format!("Project not found: {}", id))?;
 
+    let mut updated = lib.projects[index].clone();
+
     if let Some(name) = patch.name {
-        project.name = name;
+        updated.name = name;
     }
     if let Some(description) = patch.description {
-        project.description = description;
+        updated.description = description;
     }
     if let Some(cover_image) = patch.cover_image {
-        project.cover_image = if cover_image.is_empty() {
+        updated.cover_image = if cover_image.is_empty() {
             None
         } else {
             Some(cover_image)
         };
     }
     if let Some(vp) = patch.viewer_preference {
-        project.viewer_preference = if vp.is_empty() { None } else { Some(vp) };
+        updated.viewer_preference = if vp.is_empty() { None } else { Some(vp) };
+    }
+    if let Some(favorite) = patch.favorite {
+        updated.favorite = favorite;
     }
     if let Some(tags) = patch.tags {
-        project.tags = tags;
+        updated.tags = tags;
     }
     if let Some(fp) = patch.file_path {
-        project.file_missing = !Path::new(&fp).exists();
-        project.file_path = fp;
+        updated.file_missing = !Path::new(&fp).exists();
+        updated.file_path = fp;
     }
 
-    let updated = project.clone();
-    save_library(&lib)?;
+    persist_project(&updated)?;
+    lib.projects[index] = updated.clone();
     if let Err(error) = sync_index_for_project_if_present(&updated) {
         eprintln!("Failed to update perk index after edit: {}", error);
     }
@@ -2119,11 +2150,10 @@ pub fn update_project(
 }
 
 #[tauri::command]
-pub fn set_project_viewer_preference(
+pub fn set_project_favorite(
     id: String,
-    viewer_preference: String,
+    favorite: bool,
     state: State<LibraryState>,
-    save_queue: State<LibrarySaveSender>,
 ) -> Result<Project, String> {
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     let project = lib
@@ -2132,20 +2162,40 @@ pub fn set_project_viewer_preference(
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Project not found: {}", id))?;
 
+    project.favorite = favorite;
+    let updated = project.clone();
+    drop(lib);
+
+    persist_project_favorite(&updated.id, updated.favorite)?;
+
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn set_project_viewer_preference(
+    id: String,
+    viewer_preference: String,
+    state: State<LibraryState>,
+) -> Result<Project, String> {
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let index = lib
+        .projects
+        .iter()
+        .position(|p| p.id == id)
+        .ok_or_else(|| format!("Project not found: {}", id))?;
+
     let trimmed = viewer_preference.trim();
-    project.viewer_preference = if trimmed.is_empty() {
+    let next_viewer_preference = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     };
 
-    let updated = project.clone();
-    let snapshot = lib.clone();
-    drop(lib);
+    persist_project_viewer_preference(&id, next_viewer_preference.as_deref())?;
 
-    save_queue
-        .send(snapshot)
-        .map_err(|error| format!("Failed to queue library save: {}", error))?;
+    let mut updated = lib.projects[index].clone();
+    updated.viewer_preference = next_viewer_preference;
+    lib.projects[index] = updated.clone();
 
     Ok(updated)
 }
@@ -2260,18 +2310,19 @@ fn apply_oversize_project_action_internal(
     };
 
     let mut lib = state.lock().map_err(|e| e.to_string())?;
-    let project = lib
+    let index = lib
         .projects
-        .iter_mut()
-        .find(|p| p.id == project_id)
+        .iter()
+        .position(|p| p.id == project_id)
         .ok_or_else(|| format!("Project not found: {}", project_id))?;
 
+    let mut updated = lib.projects[index].clone();
     if let Some(path) = new_path {
-        project.file_path = path.to_string_lossy().to_string();
+        updated.file_path = path.to_string_lossy().to_string();
     }
 
-    let updated = project.clone();
-    save_library(&lib)?;
+    persist_project(&updated)?;
+    lib.projects[index] = updated.clone();
     Ok(updated)
 }
 #[tauri::command]

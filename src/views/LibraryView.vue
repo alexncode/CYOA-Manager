@@ -20,6 +20,7 @@ const {
   takeLibraryMigrationNotice,
   removeProject,
   startOverwriteCatalogEntry,
+  setProjectFavorite,
   updateProject,
   openViewer,
   allTags,
@@ -29,7 +30,7 @@ const { settings } = useSettings();
 
 const search = ref("");
 const tagFilter = ref("");
-const sort = ref<SortKey>("date_added");
+const sort = ref<SortKey>("favorite_date_added");
 
 const showAdd = ref(false);
 const showBulk = ref(false);
@@ -68,6 +69,13 @@ const displayedList = computed(() => {
   }
   if (sort.value === "name") {
     list.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sort.value === "favorite_date_added") {
+    list.sort((a, b) => {
+      if (a.favorite !== b.favorite) {
+        return Number(b.favorite) - Number(a.favorite);
+      }
+      return new Date(b.date_added).getTime() - new Date(a.date_added).getTime();
+    });
   } else {
     list.sort(
       (a, b) => new Date(b.date_added).getTime() - new Date(a.date_added).getTime()
@@ -115,6 +123,10 @@ async function onRelink(project: Project, patch: ProjectPatch) {
 
 async function onOpen(project: Project, viewerId: string) {
   await openViewer(project, viewerId);
+}
+
+async function onToggleFavorite(project: Project) {
+  await setProjectFavorite(project.id, !project.favorite);
 }
 
 async function onRedownload(project: Project) {
@@ -198,9 +210,14 @@ async function onRedownload(project: Project) {
       </select>
 
       <select v-model="sort" class="filter-select" title="Sort">
+        <option value="favorite_date_added">Favorites first</option>
         <option value="date_added">Newest first</option>
         <option value="name">Name A–Z</option>
       </select>
+
+      <div class="project-count">
+        {{ projects.length }} {{ projects.length === 1 ? "project" : "projects" }}
+      </div>
 
       <div class="toolbar-spacer" />
 
@@ -245,6 +262,7 @@ async function onRedownload(project: Project) {
         :redownload-busy="redownloadingProjectId === p.id"
         :redownload-label="redownloadingProjectId === p.id ? redownloadStatus : null"
         @open="(vid) => onOpen(p, vid)"
+        @toggle-favorite="onToggleFavorite(p)"
         @redownload="onRedownload(p)"
         @remove="onRemove(p)"
         @edit="editTarget = p"
@@ -340,6 +358,16 @@ async function onRedownload(project: Project) {
   font-size: 0.875rem;
   outline: none;
   cursor: pointer;
+}
+
+.project-count {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.875rem;
+  white-space: nowrap;
 }
 
 .toolbar-spacer { flex: 1; }

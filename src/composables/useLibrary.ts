@@ -155,6 +155,38 @@ export function useLibrary() {
     return updated;
   }
 
+  function setProjectFavoriteLocally(id: string, favorite: boolean) {
+    const idx = projects.value.findIndex((p) => p.id === id);
+    if (idx === -1) {
+      return;
+    }
+
+    projects.value[idx] = {
+      ...projects.value[idx],
+      favorite,
+    };
+  }
+
+  async function setProjectFavorite(id: string, favorite: boolean): Promise<Project> {
+    const idx = projects.value.findIndex((p) => p.id === id);
+    const previousFavorite = idx === -1 ? null : projects.value[idx].favorite;
+
+    setProjectFavoriteLocally(id, favorite);
+
+    try {
+      const updated = await invoke<Project>("set_project_favorite", { id, favorite });
+      if (idx !== -1) {
+        projects.value[idx] = updated;
+      }
+      return updated;
+    } catch (error) {
+      if (previousFavorite !== null) {
+        setProjectFavoriteLocally(id, previousFavorite);
+      }
+      throw error;
+    }
+  }
+
   function setProjectViewerPreferenceLocally(id: string, viewerId: string) {
     const idx = projects.value.findIndex((p) => p.id === id);
     if (idx === -1) {
@@ -246,6 +278,7 @@ export function useLibrary() {
     clearLibrary,
     compressLibraryCoverImages,
     updateProject,
+    setProjectFavorite,
     openViewer,
     scanFolder,
     startScanFolder,

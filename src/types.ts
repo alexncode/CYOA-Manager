@@ -6,6 +6,7 @@ export interface Project {
   source_url?: string | null;
   file_path: string;
   viewer_preference: string | null;
+  favorite: boolean;
   date_added: string;
   tags: string[];
   file_missing: boolean;
@@ -17,6 +18,7 @@ export interface ProjectPatch {
   /** empty string clears the cover */
   cover_image?: string;
   viewer_preference?: string;
+  favorite?: boolean;
   tags?: string[];
   /** re-link a broken card */
   file_path?: string;
@@ -65,7 +67,7 @@ export interface CatalogEntry {
   description?: string;
 }
 
-export type SortKey = "name" | "date_added";
+export type SortKey = "name" | "date_added" | "favorite_date_added";
 export type Theme = "light" | "dark" | "system";
 export type OversizeDefaultAction = "ask" | "keep-separate" | "compress";
 export type OversizeActionStrategy = "keep-separate" | "compress" | "do-nothing";

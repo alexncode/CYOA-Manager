@@ -7,6 +7,10 @@ const props = defineProps<{
   perk: PerkSearchResult;
 }>();
 
+const emit = defineEmits<{
+  (e: "open-project", projectId: string): void;
+}>();
+
 const cardRef = useTemplateRef<HTMLElement>("cardRef");
 const imageSrc = ref<string | null>(null);
 const imageVisible = ref(false);
@@ -60,7 +64,9 @@ onBeforeUnmount(() => {
     <img v-if="imageSrc" class="perk-image" :src="imageSrc" :alt="perk.title" loading="lazy" />
     <div class="perk-body">
       <div class="perk-meta">
-        <span class="perk-project" title="CYOA Name">{{ perk.projectName }}</span>
+        <button class="perk-project" title="Open project" @click="emit('open-project', perk.projectId)">
+          {{ perk.projectName }}
+        </button>
         <p v-html="perk.rowTitle" title="Row Title" class="perk-row"></p>
       </div>
       <h3 class="perk-title" v-html="perk.title" />
@@ -160,5 +166,15 @@ onBeforeUnmount(() => {
 
 .perk-project {
   font-weight: 600;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+}
+
+.perk-project:hover {
+  text-decoration: underline;
 }
 </style>

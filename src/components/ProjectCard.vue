@@ -19,6 +19,7 @@ const emit = defineEmits<{
   (e: "edit"): void;
   (e: "relink"): void;
   (e: "redownload"): Promise<void> | void;
+  (e: "toggle-favorite"): void;
 }>();
 
 const menuOpen = ref(false);
@@ -107,6 +108,10 @@ function onOpen(viewerId: string) {
   emit("open", viewerId);
 }
 
+function onToggleFavorite() {
+  emit("toggle-favorite");
+}
+
 function onImageError() {
   imageFailed.value = true;
 }
@@ -179,6 +184,14 @@ async function onRedownload() {
 
       <!-- Menu button -->
       <button class="menu-btn" @click.stop="openMenu" title="Options">⋮</button>
+      <button
+        class="favorite-btn"
+        :class="{ active: project.favorite }"
+        :title="project.favorite ? 'Remove favorite' : 'Add favorite'"
+        @click.stop="onToggleFavorite"
+      >
+        {{ project.favorite ? "♥" : "♡" }}
+      </button>
 
       <!-- Overflow menu -->
       <div v-if="menuOpen" class="menu" @click.stop>
@@ -335,6 +348,39 @@ async function onRedownload() {
 }
 .card:hover .menu-btn {
   opacity: 1;
+}
+
+.favorite-btn {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  background: rgba(0, 0, 0, 0.5);
+  border: none;
+  color: rgba(255, 255, 255, 0.88);
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s, transform 0.15s;
+}
+
+.card:hover .favorite-btn,
+.favorite-btn.active {
+  opacity: 1;
+}
+
+.favorite-btn:hover {
+  background: rgba(0, 0, 0, 0.72);
+  transform: scale(1.04);
+}
+
+.favorite-btn.active {
+  color: #ff7a8f;
 }
 
 .menu {

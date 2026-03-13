@@ -12,6 +12,8 @@ pub struct Project {
     pub source_url: Option<String>,
     pub file_path: String,
     pub viewer_preference: Option<String>,
+    #[serde(default)]
+    pub favorite: bool,
     pub date_added: String,
     pub tags: Vec<String>,
     #[serde(default)]
@@ -40,6 +42,7 @@ pub struct ProjectPatch {
     /// `None` → don't touch; `Some("")` → clear; `Some(url)` → set
     pub cover_image: Option<String>,
     pub viewer_preference: Option<String>,
+    pub favorite: Option<bool>,
     pub tags: Option<Vec<String>>,
     /// Re-link a broken card to a new path
     pub file_path: Option<String>,
