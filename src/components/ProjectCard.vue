@@ -16,6 +16,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "open", viewerId: string): void;
   (e: "remove"): void;
+  (e: "remove-disk"): void;
   (e: "edit"): void;
   (e: "relink"): void;
   (e: "redownload"): Promise<void> | void;
@@ -200,6 +201,7 @@ async function onRedownload() {
           🔗 Re-link file
         </button>
         <button class="danger" @click="emit('remove'); closeMenu()">🗑 Remove</button>
+        <button class="danger" @click="emit('remove-disk'); closeMenu()">🗑 Remove from disk</button>
       </div>
     </div>
 

@@ -2396,6 +2396,23 @@ fn existing_project_file_path(project_id: &str, state: &State<LibraryState>) -> 
         .map(|project| PathBuf::from(&project.file_path))
 }
 
+fn removable_project_target_path(project_file_path: &Path) -> PathBuf {
+    let is_folder_project = project_file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("project.json"))
+        .unwrap_or(false);
+
+    if is_folder_project {
+        return project_file_path
+            .parent()
+            .map(|value| value.to_path_buf())
+            .unwrap_or_else(|| project_file_path.to_path_buf());
+    }
+
+    project_file_path.to_path_buf()
+}
+
 fn normalize_source_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2435,6 +2452,38 @@ pub fn remove_project(id: String, state: State<LibraryState>) -> Result<(), Stri
     lib.projects.retain(|p| p.id != id);
     if let Err(error) = remove_project_from_index_if_present(&id) {
         eprintln!("Failed to update perk index after removal: {}", error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_project_from_disk(id: String, state: State<LibraryState>) -> Result<(), String> {
+    let target_path = {
+        let lib = state.lock().map_err(|e| e.to_string())?;
+        let project = lib
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| format!("Project not found: {}", id))?;
+        removable_project_target_path(Path::new(&project.file_path))
+    };
+
+    if target_path.exists() {
+        if target_path.is_dir() {
+            std::fs::remove_dir_all(&target_path)
+                .map_err(|error| format!("Failed to delete project folder: {}", error))?;
+        } else {
+            std::fs::remove_file(&target_path)
+                .map_err(|error| format!("Failed to delete project file: {}", error))?;
+        }
+    }
+
+    delete_library_project(&id)?;
+
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    lib.projects.retain(|project| project.id != id);
+    if let Err(error) = remove_project_from_index_if_present(&id) {
+        eprintln!("Failed to update perk index after disk removal: {}", error);
     }
     Ok(())
 }

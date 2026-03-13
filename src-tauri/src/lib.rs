@@ -46,6 +46,7 @@ pub fn run() {
             start_overwrite_catalog_entry,
             start_apply_oversize_project_action,
             remove_project,
+            remove_project_from_disk,
             update_project,
             set_project_favorite,
             set_project_viewer_preference,

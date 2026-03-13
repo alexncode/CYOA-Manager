@@ -136,6 +136,11 @@ export function useLibrary() {
     projects.value = projects.value.filter((p) => p.id !== id);
   }
 
+  async function removeProjectFromDisk(id: string) {
+    await invoke("remove_project_from_disk", { id });
+    projects.value = projects.value.filter((p) => p.id !== id);
+  }
+
   async function clearLibrary() {
     await invoke("clear_library");
     projects.value = [];
@@ -277,6 +282,7 @@ export function useLibrary() {
     startApplyOversizeProjectAction,
     addProjectsBulk,
     removeProject,
+    removeProjectFromDisk,
     clearLibrary,
     compressLibraryCoverImages,
     updateProject,

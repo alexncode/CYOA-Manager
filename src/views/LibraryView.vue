@@ -19,6 +19,7 @@ const {
   loadLibrary,
   takeLibraryMigrationNotice,
   removeProject,
+  removeProjectFromDisk,
   startOverwriteCatalogEntry,
   setProjectFavorite,
   updateProject,
@@ -37,6 +38,8 @@ const showBulk = ref(false);
 const showDownload = ref(false);
 const editTarget = ref<Project | null>(null);
 const relinkTarget = ref<Project | null>(null);
+const removeFromDiskTarget = ref<Project | null>(null);
+const removingFromDisk = ref(false);
 const migrationNotice = ref<string | null>(null);
 const redownloadingProjectId = ref<string | null>(null);
 const redownloadStatus = ref<string | null>(null);
@@ -109,6 +112,40 @@ async function clearRedownloadListener() {
 async function onRemove(project: Project) {
   if (!confirm(`Remove "${project.name}" from library?`)) return;
   await removeProject(project.id);
+}
+
+function removableDiskTargetPath(project: Project) {
+  const normalized = project.file_path.replace(/\\/g, "/");
+  if (normalized.toLowerCase().endsWith("/project.json")) {
+    return normalized.slice(0, -"/project.json".length);
+  }
+  return project.file_path;
+}
+
+function onRequestRemoveFromDisk(project: Project) {
+  removeFromDiskTarget.value = project;
+}
+
+function cancelRemoveFromDisk() {
+  if (removingFromDisk.value) {
+    return;
+  }
+
+  removeFromDiskTarget.value = null;
+}
+
+async function confirmRemoveFromDisk() {
+  if (!removeFromDiskTarget.value || removingFromDisk.value) {
+    return;
+  }
+
+  removingFromDisk.value = true;
+  try {
+    await removeProjectFromDisk(removeFromDiskTarget.value.id);
+    removeFromDiskTarget.value = null;
+  } finally {
+    removingFromDisk.value = false;
+  }
 }
 
 async function onEdit(project: Project, patch: ProjectPatch) {
@@ -265,6 +302,7 @@ async function onRedownload(project: Project) {
         @toggle-favorite="onToggleFavorite(p)"
         @redownload="onRedownload(p)"
         @remove="onRemove(p)"
+        @remove-disk="onRequestRemoveFromDisk(p)"
         @edit="editTarget = p"
         @relink="relinkTarget = p"
       />
@@ -307,6 +345,22 @@ async function onRedownload(project: Project) {
       <p>{{ migrationNotice }}</p>
       <div class="dialog-actions">
         <button class="btn-primary" @click="closeMigrationNotice">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="removeFromDiskTarget" class="overlay" @click.self="cancelRemoveFromDisk">
+    <div class="dialog migration-dialog">
+      <h2>Remove From Disk?</h2>
+      <p>
+        This will remove <strong>{{ removeFromDiskTarget.name }}</strong> from the library and permanently delete it from disk.
+      </p>
+      <p class="disk-path">{{ removableDiskTargetPath(removeFromDiskTarget) }}</p>
+      <div class="dialog-actions">
+        <button class="btn-secondary" :disabled="removingFromDisk" @click="cancelRemoveFromDisk">Cancel</button>
+        <button class="btn-danger" :disabled="removingFromDisk" @click="confirmRemoveFromDisk">
+          {{ removingFromDisk ? "Removing..." : "Remove from disk" }}
+        </button>
       </div>
     </div>
   </div>
@@ -443,6 +497,18 @@ async function onRedownload(project: Project) {
   margin: 0;
   color: var(--muted);
   line-height: 1.5;
+}
+
+.disk-path {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.82rem;
+  word-break: break-all;
 }
 
 .dialog-actions {
