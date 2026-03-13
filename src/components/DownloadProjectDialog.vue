@@ -12,10 +12,11 @@ const emit = defineEmits<{
   (e: "close"): void;
 }>();
 
-const { startDownloadProject, startApplyOversizeProjectAction } = useLibrary();
+const { startDownloadProject, startApplyOversizeProjectAction, loadViewers } = useLibrary();
 const { settings } = useSettings();
 
 const url = ref("");
+const downloadIncludedIccPlusViewer = ref(false);
 const downloading = ref(false);
 const errorMsg = ref("");
 const progress = ref(0);
@@ -124,6 +125,9 @@ async function submit() {
         }
 
         if (payload.success) {
+          if (downloadIncludedIccPlusViewer.value) {
+            await loadViewers();
+          }
           emit("added");
           emit("close");
         } else {
@@ -142,8 +146,11 @@ async function submit() {
         }
       }
     });
-
-    taskId = await startDownloadProject(trimmed, Math.max(1, Math.floor(settings.value.downloadSizeLimitMb || 200)));
+    taskId = await startDownloadProject(
+      trimmed,
+      Math.max(1, Math.floor(settings.value.downloadSizeLimitMb || 200)),
+      downloadIncludedIccPlusViewer.value,
+    );
   } catch (e: any) {
     downloading.value = false;
     errorMsg.value = String(e);
@@ -289,6 +296,21 @@ function getAutoOversizeAction(): OversizeActionStrategy | null {
         />
       </label>
 
+      <label class="viewer-toggle">
+        <span class="viewer-toggle-row">
+          <input
+            v-model="downloadIncludedIccPlusViewer"
+            type="checkbox"
+            :disabled="downloading"
+          />
+          <span>Download with a included ICC+ viewer</span>
+        </span>
+      </label>
+
+      <p class="viewer-hint">
+        Checks the site for an ICC+ style viewer bundle and saves it into the local viewers folder with the project version when possible.
+      </p>
+
       <ProgressBar
         v-if="downloading"
         :label="progressLabel"
@@ -348,6 +370,15 @@ label {
   color: var(--muted);
   font-size: 0.9rem;
 }
+.viewer-toggle {
+  gap: 0;
+}
+.viewer-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+}
 input {
   background: var(--input-bg);
   border: 1px solid var(--border);
@@ -359,6 +390,17 @@ input {
 }
 input:focus {
   border-color: var(--accent);
+}
+.viewer-toggle input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+.viewer-hint {
+  margin: -8px 0 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--muted);
 }
 .error {
   background: rgba(200, 50, 50, 0.15);

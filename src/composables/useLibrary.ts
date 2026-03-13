@@ -60,10 +60,12 @@ export function useLibrary() {
   async function startDownloadProject(
     url: string,
     maxProjectSizeMb: number,
+    downloadIncludedIccPlusViewer: boolean,
   ): Promise<string> {
     return invoke<string>("start_download_project", {
       url,
       maxProjectSizeMb,
+      downloadIncludedIccPlusViewer,
     });
   }
 

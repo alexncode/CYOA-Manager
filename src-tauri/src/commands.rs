@@ -198,6 +198,7 @@ pub fn start_download_project(
     app: tauri::AppHandle,
     url: String,
     max_project_size_mb: u64,
+    download_included_icc_plus_viewer: bool,
 ) -> Result<String, String> {
     let task_id = Uuid::new_v4().to_string();
     let app_handle = app.clone();
@@ -205,7 +206,13 @@ pub fn start_download_project(
     let limit_mb = max_project_size_mb.clamp(1, 2000);
 
     thread::spawn(move || {
-        if let Err(error) = run_download_project(&app_handle, &task_id_for_thread, url, limit_mb) {
+        if let Err(error) = run_download_project(
+            &app_handle,
+            &task_id_for_thread,
+            url,
+            limit_mb,
+            download_included_icc_plus_viewer,
+        ) {
             emit_download_progress(
                 app_handle,
                 DownloadProjectProgress {
@@ -330,6 +337,7 @@ fn run_download_project(
     task_id: &str,
     url: String,
     max_project_size_mb: u64,
+    download_included_icc_plus_viewer: bool,
 ) -> Result<(), String> {
     emit_download_progress(
         app.clone(),
@@ -391,6 +399,21 @@ fn run_download_project(
         },
     );
 
+    let downloaded_viewer_id = if download_included_icc_plus_viewer {
+        maybe_download_included_icc_plus_viewer(app, task_id, &base_url, bytes.as_ref())?
+    } else {
+        None
+    };
+    let viewer_message_suffix = if download_included_icc_plus_viewer {
+        if downloaded_viewer_id.is_some() {
+            " with bundled ICC+ viewer"
+        } else {
+            " (no bundled ICC+ viewer found on the site)"
+        }
+    } else {
+        ""
+    };
+
     let processed = inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?;
 
     let dir = cyoas_dir();
@@ -401,11 +424,14 @@ fn run_download_project(
         .map_err(|e| format!("Failed to save file: {}", e))?;
 
     let library = app.state::<LibraryState>();
-    let project = add_project_from_path(
+    let mut project = add_project_from_path(
         destination.to_string_lossy().to_string(),
         &library,
         normalize_source_url(&url),
     )?;
+    if let Some(viewer_id) = downloaded_viewer_id {
+        project = set_project_viewer_preference_after_import(&project.id, &viewer_id, &library)?;
+    }
     let max_project_size_bytes = max_project_size_mb.saturating_mul(1024 * 1024);
     ensure_project_within_size_limit(&project.id, max_project_size_bytes, &library)?;
 
@@ -418,7 +444,7 @@ fn run_download_project(
             total: 1,
             image_current: 1,
             image_total: 1,
-            message: format!("Imported {}", project.name),
+            message: format!("Imported {}{}", project.name, viewer_message_suffix),
             done: true,
             success: true,
             error: None,
@@ -973,6 +999,312 @@ fn fetch_html_page(url: tauri::Url, error_prefix: &str) -> Result<(String, tauri
     Ok((html, final_url))
 }
 
+fn maybe_download_included_icc_plus_viewer(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    base_url: &tauri::Url,
+    project_bytes: &[u8],
+) -> Result<Option<String>, String> {
+    emit_download_progress(
+        app.clone(),
+        DownloadProjectProgress {
+            task_id: task_id.to_string(),
+            phase: "checking-viewer".to_string(),
+            current: 0,
+            total: 1,
+            image_current: 0,
+            image_total: 0,
+            message: "Checking for included ICC+ viewer".to_string(),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let viewer_root_url = build_viewer_root_url(base_url)?;
+    let index_url = viewer_root_url
+        .join("index.html")
+        .map_err(|error| format!("Failed to resolve ICC+ viewer index: {}", error))?;
+    let (index_html, index_url) = match fetch_html_page(index_url, "Failed to download ICC+ viewer index") {
+        Ok(result) => result,
+        Err(_) => return Ok(None),
+    };
+
+    let mut assets = HashMap::new();
+    assets.insert("index.html".to_string(), index_url.clone());
+    for raw_path in collect_html_asset_paths(&index_html) {
+        add_viewer_asset(&mut assets, &viewer_root_url, &index_url, &raw_path);
+    }
+
+    let core_relative_path = assets
+        .keys()
+        .find(|path| path.ends_with("core.js"))
+        .cloned();
+    let app_relative_path = assets
+        .keys()
+        .find(|path| path.ends_with("app.js"))
+        .cloned();
+
+    if core_relative_path.is_none() && app_relative_path.is_none() {
+        emit_download_progress(
+            app.clone(),
+            DownloadProjectProgress {
+                task_id: task_id.to_string(),
+                phase: "checking-viewer".to_string(),
+                current: 1,
+                total: 1,
+                image_current: 0,
+                image_total: 0,
+                message: "No bundled ICC+ viewer detected on the site".to_string(),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+        return Ok(None);
+    }
+
+    if let Some(core_relative_path) = core_relative_path {
+        let core_url = assets
+            .get(&core_relative_path)
+            .cloned()
+            .ok_or_else(|| "Failed to resolve ICC+ core.js URL".to_string())?;
+        let core_js = download_text_asset(core_url.clone(), "Failed to download ICC+ core.js")?;
+
+        for raw_path in collect_core_js_asset_paths(&core_js) {
+            add_viewer_asset(&mut assets, &viewer_root_url, &viewer_root_url, &raw_path);
+        }
+    }
+
+    let css_assets: Vec<(String, tauri::Url)> = assets
+        .iter()
+        .filter(|(path, _)| path.ends_with(".css"))
+        .map(|(path, url)| (path.clone(), url.clone()))
+        .collect();
+
+    for (_, css_url) in css_assets {
+        let css = download_text_asset(css_url.clone(), "Failed to download ICC+ stylesheet")?;
+        for raw_path in collect_css_asset_paths(&css) {
+            add_viewer_asset(&mut assets, &viewer_root_url, &css_url, &raw_path);
+        }
+    }
+
+    let version = extract_project_version(project_bytes)
+        .map(|value| sanitize_version_label(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string()[..8].to_string());
+    let viewer_name = format!("ICC2 Plus {}", version);
+    let viewer_id = slugify(&viewer_name);
+    let viewer_dir = viewers_base_dir(Some(app)).join(&viewer_name);
+
+    std::fs::create_dir_all(&viewer_dir)
+        .map_err(|error| format!("Failed to create viewer folder: {}", error))?;
+
+    emit_download_progress(
+        app.clone(),
+        DownloadProjectProgress {
+            task_id: task_id.to_string(),
+            phase: "downloading-viewer".to_string(),
+            current: 0,
+            total: assets.len().max(1),
+            image_current: 0,
+            image_total: 0,
+            message: format!("Downloading bundled ICC+ viewer {}", version),
+            done: false,
+            success: false,
+            error: None,
+        },
+    );
+
+    let total_assets = assets.len().max(1);
+    let mut completed = 0usize;
+    let mut ordered_assets: Vec<_> = assets.into_iter().collect();
+    ordered_assets.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (relative_path, asset_url) in ordered_assets {
+        let bytes = download_binary_asset(asset_url, "Failed to download ICC+ asset")?;
+        let destination = viewer_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create ICC+ asset folder: {}", error))?;
+        }
+        std::fs::write(&destination, bytes)
+            .map_err(|error| format!("Failed to save ICC+ asset: {}", error))?;
+
+        completed += 1;
+        emit_download_progress(
+            app.clone(),
+            DownloadProjectProgress {
+                task_id: task_id.to_string(),
+                phase: "downloading-viewer".to_string(),
+                current: completed,
+                total: total_assets,
+                image_current: 0,
+                image_total: 0,
+                message: format!("Downloading bundled ICC+ viewer {} ({}/{})", version, completed, total_assets),
+                done: false,
+                success: false,
+                error: None,
+            },
+        );
+    }
+
+    Ok(Some(viewer_id))
+}
+
+fn build_viewer_root_url(base_url: &tauri::Url) -> Result<tauri::Url, String> {
+    let mut root = base_url.clone();
+    root.set_query(None);
+    root.set_fragment(None);
+
+    if !root.path().ends_with('/') {
+        let mut segments = root
+            .path_segments_mut()
+            .map_err(|_| "Failed to resolve viewer root URL".to_string())?;
+        segments.pop_if_empty();
+        segments.pop();
+    }
+
+    if root.path().is_empty() {
+        root.set_path("/");
+    } else if !root.path().ends_with('/') {
+        root.set_path(&format!("{}/", root.path()));
+    }
+
+    Ok(root)
+}
+
+fn add_viewer_asset(
+    assets: &mut HashMap<String, tauri::Url>,
+    root_url: &tauri::Url,
+    base_url: &tauri::Url,
+    raw_path: &str,
+) {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("data:")
+        || trimmed.starts_with("javascript:")
+        || trimmed.starts_with('#')
+    {
+        return;
+    }
+
+    let Ok(asset_url) = base_url.join(trimmed) else {
+        return;
+    };
+
+    let Some(relative_path) = viewer_asset_relative_path(root_url, &asset_url) else {
+        return;
+    };
+
+    assets.entry(relative_path).or_insert(asset_url);
+}
+
+fn viewer_asset_relative_path(root_url: &tauri::Url, asset_url: &tauri::Url) -> Option<String> {
+    if root_url.scheme() != asset_url.scheme()
+        || root_url.host_str() != asset_url.host_str()
+        || root_url.port_or_known_default() != asset_url.port_or_known_default()
+    {
+        return None;
+    }
+
+    let root_path = root_url.path();
+    let asset_path = asset_url.path();
+    if !asset_path.starts_with(root_path) {
+        return None;
+    }
+
+    let relative = asset_path[root_path.len()..].trim_start_matches('/');
+    if relative.is_empty() {
+        return None;
+    }
+
+    let mut clean_segments = Vec::new();
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        clean_segments.push(segment);
+    }
+
+    if clean_segments.is_empty() {
+        return None;
+    }
+
+    Some(clean_segments.join("/"))
+}
+
+fn collect_html_asset_paths(html: &str) -> Vec<String> {
+    let pattern = Regex::new(r#"(?:src|href)\s*=\s*["']([^"']+)["']"#)
+        .expect("valid html asset regex");
+    pattern
+        .captures_iter(html)
+        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .collect()
+}
+
+fn collect_core_js_asset_paths(core_js: &str) -> Vec<String> {
+    let pattern = Regex::new(r#"basePath\s*\+\s*["']([^"']+)["']"#)
+        .expect("valid core js asset regex");
+    pattern
+        .captures_iter(core_js)
+        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .collect()
+}
+
+fn collect_css_asset_paths(css: &str) -> Vec<String> {
+    let pattern = Regex::new(r#"url\(\s*['\"]?([^)'\"]+)['\"]?\s*\)"#)
+        .expect("valid css asset regex");
+    pattern
+        .captures_iter(css)
+        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .collect()
+}
+
+fn download_text_asset(url: tauri::Url, error_prefix: &str) -> Result<String, String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("{}: {}", error_prefix, error))?
+        .error_for_status()
+        .map_err(|error| format!("{}: {}", error_prefix, error))?;
+    response
+        .text()
+        .map_err(|error| format!("{}: {}", error_prefix, error))
+}
+
+fn download_binary_asset(url: tauri::Url, error_prefix: &str) -> Result<Vec<u8>, String> {
+    let response = reqwest::blocking::get(url)
+        .map_err(|error| format!("{}: {}", error_prefix, error))?
+        .error_for_status()
+        .map_err(|error| format!("{}: {}", error_prefix, error))?;
+    response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| format!("{}: {}", error_prefix, error))
+}
+
+fn extract_project_version(project_bytes: &[u8]) -> Option<String> {
+    let json = serde_json::from_slice::<serde_json::Value>(project_bytes).ok()?;
+    json.get("version")?.as_str().map(|value| value.trim().to_string())
+}
+
+fn sanitize_version_label(version: &str) -> String {
+    version
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
 fn candidate_page_urls(url: &tauri::Url) -> Vec<tauri::Url> {
     let mut urls = vec![url.clone()];
 
@@ -1097,6 +1429,26 @@ fn apply_catalog_project_name_override(
     lib.projects[index] = updated.clone();
     project.name = updated.name;
     Ok(())
+}
+
+fn set_project_viewer_preference_after_import(
+    project_id: &str,
+    viewer_id: &str,
+    state: &State<LibraryState>,
+) -> Result<Project, String> {
+    persist_project_viewer_preference(project_id, Some(viewer_id))?;
+
+    let mut lib = state.lock().map_err(|e| e.to_string())?;
+    let index = lib
+        .projects
+        .iter()
+        .position(|candidate| candidate.id == project_id)
+        .ok_or_else(|| format!("Project not found after import: {}", project_id))?;
+
+    let mut updated = lib.projects[index].clone();
+    updated.viewer_preference = Some(viewer_id.to_string());
+    lib.projects[index] = updated.clone();
+    Ok(updated)
 }
 
 fn download_catalog_project_zip(
