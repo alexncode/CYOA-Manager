@@ -17,6 +17,8 @@ export interface ProjectPatch {
   description?: string;
   /** empty string clears the cover */
   cover_image?: string;
+  /** empty string clears the source URL */
+  source_url?: string;
   viewer_preference?: string;
   favorite?: boolean;
   tags?: string[];

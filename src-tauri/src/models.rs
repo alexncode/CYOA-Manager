@@ -41,6 +41,8 @@ pub struct ProjectPatch {
     pub description: Option<String>,
     /// `None` → don't touch; `Some("")` → clear; `Some(url)` → set
     pub cover_image: Option<String>,
+    /// `None` → don't touch; `Some("")` → clear; `Some(url)` → normalize and set
+    pub source_url: Option<String>,
     pub viewer_preference: Option<String>,
     pub favorite: Option<bool>,
     pub tags: Option<Vec<String>>,

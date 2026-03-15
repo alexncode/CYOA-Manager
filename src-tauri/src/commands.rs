@@ -2528,6 +2528,9 @@ pub fn update_project(
             Some(cover_image)
         };
     }
+    if let Some(source_url) = patch.source_url {
+        updated.source_url = normalize_source_url(&source_url);
+    }
     if let Some(vp) = patch.viewer_preference {
         updated.viewer_preference = if vp.is_empty() { None } else { Some(vp) };
     }

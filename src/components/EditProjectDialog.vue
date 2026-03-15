@@ -17,6 +17,7 @@ const name = ref(props.project.name);
 const description = ref(props.project.description);
 const tagsRaw = ref(props.project.tags.join(", "));
 const cover = ref(props.project.cover_image ?? "");
+const sourceUrl = ref(props.project.source_url ?? "");
 const viewerPreference = ref(props.project.viewer_preference ?? "");
 const coverPreviewError = ref(false);
 
@@ -26,6 +27,7 @@ watch(() => props.project, (project) => {
   description.value = project.description;
   tagsRaw.value = project.tags.join(", ");
   cover.value = project.cover_image ?? "";
+  sourceUrl.value = project.source_url ?? "";
   viewerPreference.value = project.viewer_preference ?? "";
 }, { deep: true });
 
@@ -42,6 +44,7 @@ function save() {
     name: name.value.trim() || props.project.name,
     description: description.value,
     cover_image: cover.value,
+    source_url: sourceUrl.value,
     viewer_preference: viewerPreference.value,
     tags: tagsRaw.value
       .split(",")
@@ -90,6 +93,10 @@ function save() {
           @error="coverPreviewError = true"
           alt="cover preview"
         />
+      </label>
+
+      <label>Source URL
+        <input v-model="sourceUrl" type="text" placeholder="https://... or leave empty" />
       </label>
 
       <div class="file-path">
