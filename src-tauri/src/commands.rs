@@ -103,6 +103,27 @@ struct BulkScanProgress {
     paths: Vec<String>,
 }
 
+struct DownloadedRemoteAsset {
+    bytes: Vec<u8>,
+    mime: String,
+}
+
+struct SavedProjectAsset {
+    relative_path: String,
+    bytes: Vec<u8>,
+}
+
+struct ProcessedDownloadedProject {
+    json_bytes: Vec<u8>,
+    saved_assets: Vec<SavedProjectAsset>,
+}
+
+#[derive(Clone)]
+struct EmbeddedHtmlImageRef {
+    raw_src: String,
+    resolved_url: tauri::Url,
+}
+
 // ─── Library CRUD ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -414,14 +435,10 @@ fn run_download_project(
         ""
     };
 
-    let processed = inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?;
-
     let dir = cyoas_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cyoas folder: {}", e))?;
-    let destination = unique_path(dir.join(download_file_name(&base_url)));
-
-    std::fs::write(&destination, processed)
-        .map_err(|e| format!("Failed to save file: {}", e))?;
+    let processed = process_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?;
+    let destination = save_processed_downloaded_project(&dir, &base_url, None, processed)?;
 
     let library = app.state::<LibraryState>();
     let mut project = add_project_from_path(
@@ -728,9 +745,9 @@ fn download_catalog_website_project_to_destination(
     }
 
     let processed = if let Some((app, task_id)) = progress {
-        inline_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?
+        process_downloaded_project_images(bytes.as_ref(), &base_url, app, task_id)?
     } else {
-        inline_downloaded_project_images_silent(bytes.as_ref(), &base_url)?
+        process_downloaded_project_images_silent(bytes.as_ref(), &base_url)?
     };
 
     let dir = cyoas_dir();
@@ -752,10 +769,7 @@ fn download_catalog_website_project_to_destination(
         );
     }
 
-    let destination = destination_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| unique_path(dir.join(download_file_name(&base_url))));
-    std::fs::write(&destination, processed).map_err(|e| format!("Failed to save file: {}", e))?;
+    let destination = save_processed_downloaded_project(&dir, &base_url, destination_override, processed)?;
 
     Ok(destination)
 }
@@ -2257,29 +2271,7 @@ fn add_project_from_path(
     let json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("Not valid JSON: {}", e))?;
 
-    let filename_contains_project = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase().contains("project"))
-        .unwrap_or(false);
-
-    let name = if filename_contains_project {
-        extract_first_row_title(&json)
-            .or_else(|| extract_project_name(&json))
-            .unwrap_or_else(|| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unnamed")
-                    .to_string()
-            })
-    } else {
-        extract_project_name(&json).unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unnamed")
-                .to_string()
-        })
-    };
+    let name = derive_library_project_name(&json, source_url.as_deref());
 
     let cover_image = compress_cover_image_for_library(
         &file_path,
@@ -2328,29 +2320,7 @@ fn replace_project_from_path(
     let json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("Not valid JSON: {}", e))?;
 
-    let filename_contains_project = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase().contains("project"))
-        .unwrap_or(false);
-
-    let derived_name = if filename_contains_project {
-        extract_first_row_title(&json)
-            .or_else(|| extract_project_name(&json))
-            .unwrap_or_else(|| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unnamed")
-                    .to_string()
-            })
-    } else {
-        extract_project_name(&json).unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unnamed")
-                .to_string()
-        })
-    };
+    let derived_name = derive_library_project_name(&json, source_url.as_deref());
 
     let cover_image = compress_cover_image_for_library(
         &file_path,
@@ -2696,6 +2666,7 @@ fn apply_oversize_project_action_internal(
     let bytes = std::fs::read(&project_path)
         .map_err(|e| format!("Failed to read project file: {}", e))?;
 
+    let old_target_path = removable_project_target_path(Path::new(&project_path));
     let new_path = match strategy {
         OversizeStrategy::KeepSeparate => {
             let extracted_path = extract_project_images_to_folder(&project_path, &bytes)?;
@@ -2712,6 +2683,19 @@ fn apply_oversize_project_action_internal(
         }
         OversizeStrategy::DoNothing => None,
     };
+
+    if let Some(path) = new_path.as_ref() {
+        let new_target_path = removable_project_target_path(path);
+        if new_target_path != old_target_path && old_target_path.exists() {
+            if old_target_path.is_dir() {
+                std::fs::remove_dir_all(&old_target_path)
+                    .map_err(|error| format!("Failed to replace existing project folder: {}", error))?;
+            } else {
+                std::fs::remove_file(&old_target_path)
+                    .map_err(|error| format!("Failed to replace existing project file: {}", error))?;
+            }
+        }
+    }
 
     let mut lib = state.lock().map_err(|e| e.to_string())?;
     let index = lib
@@ -2985,9 +2969,7 @@ fn ensure_project_within_size_limit(
         .find(|candidate| candidate.id == project_id)
         .ok_or_else(|| format!("Project not found after import: {}", project_id))?;
 
-    let metadata = std::fs::metadata(&project.file_path)
-        .map_err(|e| format!("Failed to read project metadata: {}", e))?;
-    let size = metadata.len();
+    let size = project_storage_size(Path::new(&project.file_path))?;
 
     if size > max_project_size_bytes {
         return Err(format!("OVERSIZE|{}|{}|{}", project.id, size, max_project_size_bytes));
@@ -3061,15 +3043,130 @@ fn unique_dir_path(path: PathBuf) -> PathBuf {
     parent.join(format!("{}-{}", base, Uuid::new_v4()))
 }
 
-fn inline_downloaded_project_images(
+fn folder_project_dir_for_destination(destination: &Path) -> PathBuf {
+    let is_project_json = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("project.json"))
+        .unwrap_or(false);
+
+    if is_project_json {
+        return destination
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| destination.to_path_buf());
+    }
+
+    let parent = destination.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    parent.join(stem)
+}
+
+fn remove_existing_project_target(
+    current_path: &Path,
+    replacement_dir: Option<&Path>,
+) -> Result<(), String> {
+    let existing_target = removable_project_target_path(current_path);
+
+    if let Some(replacement_dir) = replacement_dir {
+        if existing_target == replacement_dir {
+            if existing_target.exists() {
+                std::fs::remove_dir_all(&existing_target)
+                    .map_err(|error| format!("Failed to replace existing project folder: {}", error))?;
+            }
+            return Ok(());
+        }
+    }
+
+    if !existing_target.exists() {
+        return Ok(());
+    }
+
+    if existing_target.is_dir() {
+        std::fs::remove_dir_all(&existing_target)
+            .map_err(|error| format!("Failed to replace existing project folder: {}", error))?;
+    } else {
+        std::fs::remove_file(&existing_target)
+            .map_err(|error| format!("Failed to replace existing project file: {}", error))?;
+    }
+
+    Ok(())
+}
+
+fn save_processed_downloaded_project(
+    root_dir: &Path,
+    base_url: &tauri::Url,
+    destination_override: Option<&Path>,
+    processed: ProcessedDownloadedProject,
+) -> Result<PathBuf, String> {
+    if processed.saved_assets.is_empty() {
+        let destination = destination_override
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| unique_path(root_dir.join(download_file_name(base_url))));
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create destination folder: {}", e))?;
+        }
+        std::fs::write(&destination, processed.json_bytes)
+            .map_err(|e| format!("Failed to save file: {}", e))?;
+        return Ok(destination);
+    }
+
+    let default_folder_name = Path::new(&download_file_name(base_url))
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("downloaded-cyoa-project")
+        .to_string();
+
+    let project_dir = match destination_override {
+        Some(path) => folder_project_dir_for_destination(path),
+        None => unique_dir_path(root_dir.join(default_folder_name)),
+    };
+
+    if let Some(path) = destination_override {
+        remove_existing_project_target(path, Some(&project_dir))?;
+    }
+
+    std::fs::create_dir_all(&project_dir)
+        .map_err(|e| format!("Failed to create project folder: {}", e))?;
+
+    for asset in processed.saved_assets {
+        let destination = project_dir.join(asset.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create asset folder: {}", e))?;
+        }
+        std::fs::write(&destination, asset.bytes)
+            .map_err(|e| format!("Failed to save embedded image: {}", e))?;
+    }
+
+    let project_json_path = project_dir.join("project.json");
+    std::fs::write(&project_json_path, processed.json_bytes)
+        .map_err(|e| format!("Failed to save file: {}", e))?;
+
+    Ok(project_json_path)
+}
+
+fn process_downloaded_project_images(
     bytes: &[u8],
     base_url: &tauri::Url,
     app: &tauri::AppHandle,
     task_id: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<ProcessedDownloadedProject, String> {
     let mut json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("Downloaded file is not valid JSON: {}", e))?;
-    let image_refs = collect_image_refs(&json, base_url);
+    let inline_image_refs = collect_image_refs(&json, base_url);
+    let embedded_image_refs = collect_embedded_html_image_refs(&json, base_url);
+    let image_refs = merge_remote_asset_refs(
+        &inline_image_refs,
+        &embedded_image_refs
+            .iter()
+            .map(|reference| reference.resolved_url.clone())
+            .collect::<Vec<_>>(),
+    );
     let image_total = image_refs.len();
 
     emit_download_progress(
@@ -3092,33 +3189,59 @@ fn inline_downloaded_project_images(
         },
     );
 
-    let cache = download_images_parallel(app, task_id, image_refs)?;
+    let cache = download_remote_assets_parallel(app, task_id, image_refs)?;
     replace_image_refs(&mut json, base_url, &cache);
-    serde_json::to_vec(&json).map_err(|e| format!("Failed to serialize downloaded project: {}", e))
+    let saved_assets = replace_embedded_html_image_refs(&mut json, base_url, &embedded_image_refs, &cache);
+    let json_bytes = serde_json::to_vec(&json)
+        .map_err(|e| format!("Failed to serialize downloaded project: {}", e))?;
+
+    Ok(ProcessedDownloadedProject {
+        json_bytes,
+        saved_assets,
+    })
 }
 
-fn inline_downloaded_project_images_silent(
+fn process_downloaded_project_images_silent(
     bytes: &[u8],
     base_url: &tauri::Url,
-) -> Result<Vec<u8>, String> {
+) -> Result<ProcessedDownloadedProject, String> {
     let mut json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("Downloaded file is not valid JSON: {}", e))?;
-    let image_refs = collect_image_refs(&json, base_url);
+    let inline_image_refs = collect_image_refs(&json, base_url);
+    let embedded_image_refs = collect_embedded_html_image_refs(&json, base_url);
+    let image_refs = merge_remote_asset_refs(
+        &inline_image_refs,
+        &embedded_image_refs
+            .iter()
+            .map(|reference| reference.resolved_url.clone())
+            .collect::<Vec<_>>(),
+    );
 
     if image_refs.is_empty() {
         return serde_json::to_vec(&json)
+            .map(|json_bytes| ProcessedDownloadedProject {
+                json_bytes,
+                saved_assets: Vec::new(),
+            })
             .map_err(|e| format!("Failed to serialize downloaded project: {}", e));
     }
 
     let mut cache = HashMap::new();
     for url in image_refs {
-        if let Some(data) = download_image_as_data_uri(&url) {
-            cache.insert(url.to_string(), data);
+        if let Some(asset) = download_remote_asset(&url) {
+            cache.insert(url.to_string(), asset);
         }
     }
 
     replace_image_refs(&mut json, base_url, &cache);
-    serde_json::to_vec(&json).map_err(|e| format!("Failed to serialize downloaded project: {}", e))
+    let saved_assets = replace_embedded_html_image_refs(&mut json, base_url, &embedded_image_refs, &cache);
+
+    serde_json::to_vec(&json)
+        .map(|json_bytes| ProcessedDownloadedProject {
+            json_bytes,
+            saved_assets,
+        })
+        .map_err(|e| format!("Failed to serialize downloaded project: {}", e))
 }
 
 fn extract_project_images_to_folder(project_file_path: &str, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -3136,12 +3259,22 @@ fn extract_project_images_to_folder(project_file_path: &str, bytes: &[u8]) -> Re
         .to_string();
 
     let project_folder = unique_dir_path(source_dir.join(format!("{}-separate", stem)));
-    let images_folder = project_folder.join("images");
+    std::fs::create_dir_all(&project_folder)
+        .map_err(|e| format!("Failed to create project folder: {}", e))?;
+
+    copy_existing_project_assets(source_path, &project_folder)?;
+
+    let images_folder = unique_dir_path(project_folder.join("images"));
     std::fs::create_dir_all(&images_folder)
         .map_err(|e| format!("Failed to create images folder: {}", e))?;
 
     let mut image_index = 0usize;
-    rewrite_data_images_to_files(&mut json, &images_folder, &mut image_index)?;
+    rewrite_data_images_to_files(
+        &mut json,
+        &images_folder,
+        &path_to_project_relative(&images_folder, &project_folder)?,
+        &mut image_index,
+    )?;
 
     let serialized = serde_json::to_vec(&json)
         .map_err(|e| format!("Failed to serialize project JSON: {}", e))?;
@@ -3165,6 +3298,7 @@ fn compress_project_file_images(bytes: &[u8]) -> Result<Vec<u8>, String> {
 fn rewrite_data_images_to_files(
     value: &mut serde_json::Value,
     images_folder: &Path,
+    images_relative_path: &str,
     image_index: &mut usize,
 ) -> Result<(), String> {
     match value {
@@ -3179,23 +3313,89 @@ fn rewrite_data_images_to_files(
                             let image_path = images_folder.join(&filename);
                             std::fs::write(&image_path, bytes)
                                 .map_err(|e| format!("Failed writing extracted image: {}", e))?;
-                            *text = format!("images/{}", filename);
+                            *text = format!("{}/{}", images_relative_path, filename);
                         }
                     }
                 } else {
-                    rewrite_data_images_to_files(child, images_folder, image_index)?;
+                    rewrite_data_images_to_files(child, images_folder, images_relative_path, image_index)?;
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                rewrite_data_images_to_files(item, images_folder, image_index)?;
+                rewrite_data_images_to_files(item, images_folder, images_relative_path, image_index)?;
             }
         }
         _ => {}
     }
 
     Ok(())
+}
+
+fn copy_existing_project_assets(source_project_path: &Path, destination_dir: &Path) -> Result<(), String> {
+    let is_folder_project = source_project_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("project.json"))
+        .unwrap_or(false);
+
+    if !is_folder_project {
+        return Ok(());
+    }
+
+    let source_root = source_project_path
+        .parent()
+        .ok_or_else(|| "Project path has no parent directory".to_string())?;
+
+    for entry in walkdir::WalkDir::new(source_root) {
+        let entry = entry.map_err(|error| format!("Failed to read project folder: {}", error))?;
+        let entry_path = entry.path();
+        if entry_path == source_project_path {
+            continue;
+        }
+
+        let relative_path = entry_path
+            .strip_prefix(source_root)
+            .map_err(|error| format!("Failed to resolve project asset path: {}", error))?;
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let destination_path = destination_dir.join(relative_path);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&destination_path)
+                .map_err(|error| format!("Failed to create project asset folder: {}", error))?;
+            continue;
+        }
+
+        if let Some(parent) = destination_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create project asset folder: {}", error))?;
+        }
+        std::fs::copy(entry_path, &destination_path)
+            .map_err(|error| format!("Failed to copy project asset: {}", error))?;
+    }
+
+    Ok(())
+}
+
+fn path_to_project_relative(path: &Path, project_dir: &Path) -> Result<String, String> {
+    let relative = path
+        .strip_prefix(project_dir)
+        .map_err(|error| format!("Failed to resolve project relative path: {}", error))?;
+
+    let normalized = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if normalized.is_empty() {
+        return Err("Project relative path was empty".to_string());
+    }
+
+    Ok(normalized)
 }
 
 fn compress_data_uri_images_in_json(value: &mut serde_json::Value, max_bytes: usize) -> Result<(), String> {
@@ -3356,10 +3556,69 @@ fn collect_image_refs_inner(
     }
 }
 
+fn collect_embedded_html_image_refs(
+    value: &serde_json::Value,
+    base_url: &tauri::Url,
+) -> Vec<EmbeddedHtmlImageRef> {
+    let mut refs = HashSet::new();
+    let mut collected = Vec::new();
+    collect_embedded_html_image_refs_inner(value, base_url, &mut refs, &mut collected);
+    collected
+}
+
+fn collect_embedded_html_image_refs_inner(
+    value: &serde_json::Value,
+    base_url: &tauri::Url,
+    refs: &mut HashSet<String>,
+    collected: &mut Vec<EmbeddedHtmlImageRef>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for child in map.values() {
+                collect_embedded_html_image_refs_inner(child, base_url, refs, collected);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_embedded_html_image_refs_inner(item, base_url, refs, collected);
+            }
+        }
+        serde_json::Value::String(text) => {
+            for src in collect_html_img_sources(text) {
+                if let Some(url) = resolve_remote_asset_url(base_url, src.trim()) {
+                    if refs.insert(url.to_string()) {
+                        collected.push(EmbeddedHtmlImageRef {
+                            raw_src: src,
+                            resolved_url: url,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn merge_remote_asset_refs(
+    inline_image_refs: &[tauri::Url],
+    embedded_image_refs: &[tauri::Url],
+) -> Vec<tauri::Url> {
+    let mut seen = HashSet::new();
+    let mut combined = Vec::new();
+
+    for url in inline_image_refs.iter().chain(embedded_image_refs.iter()) {
+        if seen.insert(url.to_string()) {
+            combined.push(url.clone());
+        }
+    }
+
+    combined
+}
+
 fn replace_image_refs(
     value: &mut serde_json::Value,
     base_url: &tauri::Url,
-    cache: &HashMap<String, String>,
+    cache: &HashMap<String, DownloadedRemoteAsset>,
 ) {
     match value {
         serde_json::Value::Object(map) => {
@@ -3368,8 +3627,8 @@ fn replace_image_refs(
                     if is_image_field(key) {
                         let trimmed = text.trim();
                         if let Some(resolved) = resolve_remote_asset_url(base_url, trimmed) {
-                            if let Some(inlined) = cache.get(resolved.as_str()) {
-                                *text = inlined.clone();
+                            if let Some(asset) = cache.get(resolved.as_str()) {
+                                *text = remote_asset_to_data_uri(asset);
                             }
                         }
                     }
@@ -3385,6 +3644,243 @@ fn replace_image_refs(
         }
         _ => {}
     }
+}
+
+fn replace_embedded_html_image_refs(
+    value: &mut serde_json::Value,
+    base_url: &tauri::Url,
+    embedded_image_refs: &[EmbeddedHtmlImageRef],
+    cache: &HashMap<String, DownloadedRemoteAsset>,
+) -> Vec<SavedProjectAsset> {
+    let mut path_by_url = HashMap::new();
+    let mut saved_assets = Vec::new();
+    let mut used_paths = HashSet::new();
+
+    let mut sorted_urls: Vec<_> = embedded_image_refs.iter().collect();
+    sorted_urls.sort_by(|left, right| left.resolved_url.as_str().cmp(right.resolved_url.as_str()));
+
+    for reference in sorted_urls {
+        let Some(asset) = cache.get(reference.resolved_url.as_str()) else {
+            continue;
+        };
+
+        let relative_path = unique_relative_asset_path(
+            derive_embedded_asset_relative_path(reference, &asset.mime),
+            &mut used_paths,
+        );
+        path_by_url.insert(reference.resolved_url.to_string(), relative_path.clone());
+        saved_assets.push(SavedProjectAsset {
+            relative_path,
+            bytes: asset.bytes.clone(),
+        });
+    }
+
+    rewrite_embedded_html_img_sources(value, base_url, &path_by_url);
+    saved_assets
+}
+
+fn rewrite_embedded_html_img_sources(
+    value: &mut serde_json::Value,
+    base_url: &tauri::Url,
+    path_by_url: &HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                rewrite_embedded_html_img_sources(child, base_url, path_by_url);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_embedded_html_img_sources(item, base_url, path_by_url);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = replace_html_img_sources(text, base_url, path_by_url);
+        }
+        _ => {}
+    }
+}
+
+fn replace_html_img_sources(
+    text: &str,
+    base_url: &tauri::Url,
+    path_by_url: &HashMap<String, String>,
+) -> String {
+    let pattern = Regex::new(
+        r#"(?is)(<img\b[^>]*\bsrc\s*=\s*)(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))"#,
+    )
+    .expect("valid embedded html image regex");
+
+    pattern
+        .replace_all(text, |captures: &regex::Captures| {
+            let prefix = captures.get(1).map(|value| value.as_str()).unwrap_or_default();
+            let raw_src = captures
+                .get(2)
+                .or_else(|| captures.get(3))
+                .or_else(|| captures.get(4))
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+
+            let Some(resolved) = resolve_remote_asset_url(base_url, raw_src.trim()) else {
+                return captures.get(0).map(|value| value.as_str()).unwrap_or_default().to_string();
+            };
+
+            let Some(relative_path) = path_by_url.get(resolved.as_str()) else {
+                return captures.get(0).map(|value| value.as_str()).unwrap_or_default().to_string();
+            };
+
+            if captures.get(2).is_some() {
+                format!("{prefix}\"{relative_path}\"")
+            } else if captures.get(3).is_some() {
+                format!("{prefix}'{relative_path}'")
+            } else {
+                format!("{prefix}{relative_path}")
+            }
+        })
+        .into_owned()
+}
+
+fn collect_html_img_sources(text: &str) -> Vec<String> {
+    let pattern = Regex::new(
+        r#"(?is)<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))"#,
+    )
+    .expect("valid embedded html image regex");
+
+    pattern
+        .captures_iter(text)
+        .filter_map(|captures| {
+            captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .or_else(|| captures.get(3))
+                .map(|value| value.as_str().to_string())
+        })
+        .collect()
+}
+
+fn derive_embedded_asset_relative_path(reference: &EmbeddedHtmlImageRef, mime: &str) -> String {
+    let raw_src = reference.raw_src.trim();
+
+    if raw_src.starts_with("http://") || raw_src.starts_with("https://") || raw_src.starts_with("//") {
+        let host = reference
+            .resolved_url
+            .host_str()
+            .map(sanitize_relative_path_segment)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "remote".to_string());
+        let path = sanitized_url_path(&reference.resolved_url, mime);
+        return format!("{host}/{path}");
+    }
+
+    if raw_src.starts_with('/') {
+        return sanitize_relative_asset_path(raw_src.trim_start_matches('/'), mime);
+    }
+
+    let exact_path = sanitize_relative_asset_path(raw_src, mime);
+    if !exact_path.is_empty() && !exact_path.starts_with("../") {
+        return exact_path;
+    }
+
+    sanitized_url_path(&reference.resolved_url, mime)
+}
+
+fn sanitized_url_path(url: &tauri::Url, mime: &str) -> String {
+    let path = url.path().trim_matches('/');
+    sanitize_relative_asset_path(path, mime)
+}
+
+fn sanitize_relative_asset_path(raw_path: &str, mime: &str) -> String {
+    let without_query = raw_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .replace('\\', "/");
+
+    let mut segments = Vec::new();
+    for segment in without_query.split('/') {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() || trimmed == "." {
+            continue;
+        }
+        if trimmed == ".." {
+            continue;
+        }
+        segments.push(sanitize_relative_path_segment(trimmed));
+    }
+
+    if segments.is_empty() {
+        return format!("asset.{}", extension_for_mime(mime));
+    }
+
+    if segments.last().map(|value| !value.contains('.')).unwrap_or(false) {
+        let extension = extension_for_mime(mime);
+        if let Some(last) = segments.last_mut() {
+            *last = format!("{}.{}", last, extension);
+        }
+    }
+
+    segments.join("/")
+}
+
+fn sanitize_relative_path_segment(segment: &str) -> String {
+    let sanitized = segment
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim()
+        .to_string();
+
+    if sanitized.is_empty() {
+        "asset".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn unique_relative_asset_path(path: String, used_paths: &mut HashSet<String>) -> String {
+    if used_paths.insert(path.clone()) {
+        return path;
+    }
+
+    let path_buf = Path::new(&path);
+    let parent = path_buf.parent().and_then(|value| value.to_str()).unwrap_or("");
+    let stem = path_buf
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset");
+    let extension = path_buf.extension().and_then(|value| value.to_str()).unwrap_or("");
+
+    for index in 2..10000 {
+        let file_name = if extension.is_empty() {
+            format!("{}-{}", stem, index)
+        } else {
+            format!("{}-{}.{}", stem, index, extension)
+        };
+        let candidate = if parent.is_empty() {
+            file_name
+        } else {
+            format!("{}/{}", parent.replace('\\', "/"), file_name)
+        };
+        if used_paths.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    let fallback = if parent.is_empty() {
+        format!("{}-{}", stem, Uuid::new_v4())
+    } else {
+        format!("{}/{}-{}", parent.replace('\\', "/"), stem, Uuid::new_v4())
+    };
+    used_paths.insert(fallback.clone());
+    fallback
 }
 
 fn is_image_field(key: &str) -> bool {
@@ -3454,7 +3950,7 @@ fn resolve_cover_image_path(project_file_path: &str, cover_image: &str) -> PathB
         .unwrap_or(cover_path)
 }
 
-fn download_image_as_data_uri(url: &tauri::Url) -> Option<String> {
+fn download_remote_asset(url: &tauri::Url) -> Option<DownloadedRemoteAsset> {
     let response = reqwest::blocking::get(url.clone()).ok()?.error_for_status().ok()?;
     let mime = response
         .headers()
@@ -3469,16 +3965,20 @@ fn download_image_as_data_uri(url: &tauri::Url) -> Option<String> {
                 .map(|value| value.to_string())
         })
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let bytes = response.bytes().ok()?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(format!("data:{};base64,{}", mime, encoded))
+    let bytes = response.bytes().ok()?.to_vec();
+    Some(DownloadedRemoteAsset { bytes, mime })
 }
 
-fn download_images_parallel(
+fn remote_asset_to_data_uri(asset: &DownloadedRemoteAsset) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&asset.bytes);
+    format!("data:{};base64,{}", asset.mime, encoded)
+}
+
+fn download_remote_assets_parallel(
     app: &tauri::AppHandle,
     task_id: &str,
     image_urls: Vec<tauri::Url>,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<HashMap<String, DownloadedRemoteAsset>, String> {
     if image_urls.is_empty() {
         return Ok(HashMap::new());
     }
@@ -3497,7 +3997,7 @@ fn download_images_parallel(
         let urls = chunk.to_vec();
         thread::spawn(move || {
             for url in urls {
-                let result = download_image_as_data_uri(&url);
+                let result = download_remote_asset(&url);
                 let _ = tx.send((url, result));
             }
         });
@@ -3532,6 +4032,31 @@ fn download_images_parallel(
     Ok(cache)
 }
 
+fn project_storage_size(project_file_path: &Path) -> Result<u64, String> {
+    let target_path = removable_project_target_path(project_file_path);
+    if target_path.is_dir() {
+        let mut total = 0u64;
+        for entry in walkdir::WalkDir::new(&target_path) {
+            let entry = entry.map_err(|error| format!("Failed to read project folder: {}", error))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            total = total.saturating_add(
+                entry
+                    .metadata()
+                    .map_err(|error| format!("Failed to read project metadata: {}", error))?
+                    .len(),
+            );
+        }
+        return Ok(total);
+    }
+
+    let metadata = std::fs::metadata(&target_path)
+        .map_err(|e| format!("Failed to read project metadata: {}", e))?;
+    Ok(metadata.len())
+}
+
 fn emit_download_progress(app: tauri::AppHandle, payload: DownloadProjectProgress) {
     let _ = app.emit("download-project-progress", payload);
 }
@@ -3556,6 +4081,144 @@ fn extract_project_name(json: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn derive_library_project_name(json: &serde_json::Value, source_url: Option<&str>) -> String {
+    extract_first_row_title(json)
+        .and_then(|title| strip_html_to_text(&title))
+        .or_else(|| derive_project_name_from_url(source_url))
+        .unwrap_or_else(fallback_unknown_project_name)
+}
+
+fn strip_html_to_text(value: &str) -> Option<String> {
+    let decoded = decode_basic_html_entities(value);
+    let tag_regex = Regex::new(r"(?is)<[^>]+>").expect("valid html strip regex");
+    let without_tags = tag_regex.replace_all(&decoded, " ");
+    let normalized = without_tags
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn derive_project_name_from_url(source_url: Option<&str>) -> Option<String> {
+    let raw_url = source_url?.trim();
+    if raw_url.is_empty() {
+        return None;
+    }
+
+    let url = tauri::Url::parse(raw_url).ok()?;
+
+    last_meaningful_url_segment(&url)
+        .or_else(|| second_level_domain_label(&url))
+        .and_then(|value| prettify_project_name_token(&value))
+}
+
+fn last_meaningful_url_segment(url: &tauri::Url) -> Option<String> {
+    let segments: Vec<_> = url
+        .path_segments()?
+        .filter(|segment| !segment.trim().is_empty())
+        .collect();
+
+    for segment in segments.iter().rev() {
+        let trimmed = segment.trim();
+        if trimmed.eq_ignore_ascii_case("project.json") || trimmed.eq_ignore_ascii_case("index.html") {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+
+    None
+}
+
+fn second_level_domain_label(url: &tauri::Url) -> Option<String> {
+    let host = url.host_str()?.trim().trim_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+
+    let labels: Vec<_> = host
+        .split('.')
+        .filter(|label| !label.is_empty() && !label.eq_ignore_ascii_case("www"))
+        .collect();
+    if labels.is_empty() {
+        return None;
+    }
+
+    let common_second_level_suffixes = ["co", "com", "org", "net", "gov", "edu", "ac"];
+    if labels.len() >= 3 {
+        let last = labels[labels.len() - 1];
+        let second_last = labels[labels.len() - 2];
+        if last.len() == 2 && common_second_level_suffixes.contains(&second_last) {
+            return Some(labels[labels.len() - 3].to_string());
+        }
+    }
+
+    if labels.len() >= 2 {
+        return Some(labels[labels.len() - 2].to_string());
+    }
+
+    Some(labels[0].to_string())
+}
+
+fn prettify_project_name_token(value: &str) -> Option<String> {
+    let decoded = percent_decode_basic(value);
+    let normalized = decoded
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn percent_decode_basic(value: &str) -> String {
+    let mut output = String::new();
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                output.push(decoded as char);
+                index += 3;
+                continue;
+            }
+        }
+
+        if bytes[index] == b'+' {
+            output.push(' ');
+        } else {
+            output.push(bytes[index] as char);
+        }
+        index += 1;
+    }
+
+    output
+}
+
+fn fallback_unknown_project_name() -> String {
+    const LETTERS: &[u8; 26] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let bytes = *Uuid::new_v4().as_bytes();
+    let suffix = bytes[..4]
+        .iter()
+        .map(|byte| LETTERS[(*byte as usize) % LETTERS.len()] as char)
+        .collect::<String>();
+    format!("Unknown {}", suffix)
 }
 
 fn format_bytes_megabytes(bytes: u64) -> String {
