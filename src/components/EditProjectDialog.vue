@@ -19,6 +19,7 @@ const tagsRaw = ref(props.project.tags.join(", "));
 const cover = ref(props.project.cover_image ?? "");
 const sourceUrl = ref(props.project.source_url ?? "");
 const viewerPreference = ref(props.project.viewer_preference ?? "");
+const excludeFromPerkIndex = ref(props.project.exclude_from_perk_index);
 const coverPreviewError = ref(false);
 
 watch(() => cover.value, () => { coverPreviewError.value = false; });
@@ -29,6 +30,7 @@ watch(() => props.project, (project) => {
   cover.value = project.cover_image ?? "";
   sourceUrl.value = project.source_url ?? "";
   viewerPreference.value = project.viewer_preference ?? "";
+  excludeFromPerkIndex.value = project.exclude_from_perk_index;
 }, { deep: true });
 
 async function pickCover() {
@@ -46,6 +48,7 @@ function save() {
     cover_image: cover.value,
     source_url: sourceUrl.value,
     viewer_preference: viewerPreference.value,
+    exclude_from_perk_index: excludeFromPerkIndex.value,
     tags: tagsRaw.value
       .split(",")
       .map((t) => t.trim())
@@ -97,6 +100,11 @@ function save() {
 
       <label>Source URL
         <input v-model="sourceUrl" type="text" placeholder="https://... or leave empty" />
+      </label>
+
+      <label class="checkbox-row">
+        <input v-model="excludeFromPerkIndex" type="checkbox" />
+        <span>Exclude from Perk Index</span>
       </label>
 
       <div class="file-path">
@@ -159,6 +167,17 @@ label input:focus,
 label textarea:focus,
 label select:focus {
   border-color: var(--accent);
+}
+.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+}
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 .hint {
   font-size: 0.75rem;

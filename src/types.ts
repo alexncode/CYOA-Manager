@@ -7,6 +7,7 @@ export interface Project {
   file_path: string;
   viewer_preference: string | null;
   favorite: boolean;
+  exclude_from_perk_index: boolean;
   date_added: string;
   tags: string[];
   file_missing: boolean;
@@ -21,6 +22,7 @@ export interface ProjectPatch {
   source_url?: string;
   viewer_preference?: string;
   favorite?: boolean;
+  exclude_from_perk_index?: boolean;
   tags?: string[];
   /** re-link a broken card */
   file_path?: string;

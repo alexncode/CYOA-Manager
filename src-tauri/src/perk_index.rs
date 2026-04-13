@@ -235,7 +235,7 @@ pub fn sync_index_for_project_if_present(project: &Project) -> Result<(), String
         return Ok(());
     }
 
-    if !Path::new(&project.file_path).exists() {
+    if project.exclude_from_perk_index || !Path::new(&project.file_path).exists() {
         return remove_project_from_index_if_present(&project.id);
     }
 
@@ -578,7 +578,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 fn collect_indexable_projects(projects: &[Project]) -> Vec<Project> {
     projects
         .iter()
-        .filter(|project| Path::new(&project.file_path).exists())
+    .filter(|project| !project.exclude_from_perk_index && Path::new(&project.file_path).exists())
         .cloned()
         .collect()
 }

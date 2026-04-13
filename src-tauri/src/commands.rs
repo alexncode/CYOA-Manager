@@ -122,6 +122,7 @@ struct ProcessedDownloadedProject {
 struct EmbeddedHtmlImageRef {
     raw_src: String,
     resolved_url: tauri::Url,
+    base_dir_segments: Vec<String>,
 }
 
 // ─── Library CRUD ────────────────────────────────────────────────────────────
@@ -813,6 +814,12 @@ fn download_project_data(
             }
         }
 
+        for project_url in find_project_json_urls_in_scripts(&html, &final_page_url) {
+            if let Ok(project) = download_project_json_bytes(project_url, progress) {
+                return Ok(project);
+            }
+        }
+
         if let Some((json, base_url)) = find_embedded_project_data(&html, &final_page_url)? {
             let bytes = serde_json::to_vec(&json)
                 .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
@@ -845,6 +852,12 @@ fn download_itch_io_project_data(
         }
     }
 
+    for project_url in find_project_json_urls_in_scripts(&html, &final_url) {
+        if let Ok(project) = download_project_json_bytes(project_url, progress) {
+            return Ok(project);
+        }
+    }
+
     if let Some((json, base_url)) = find_embedded_project_data(&html, &final_url)? {
         let bytes = serde_json::to_vec(&json)
             .map_err(|e| format!("Failed to serialize embedded project data: {}", e))?;
@@ -868,6 +881,12 @@ fn download_cyoa_cafe_project_data(
 
     let (html, final_url) = fetch_html_page(url, "Failed to open cyoa.cafe page")?;
     if let Some(project_url) = find_project_json_url_in_html(&html, &final_url) {
+        if let Ok(project) = download_project_json_bytes(project_url, progress) {
+            return Ok(project);
+        }
+    }
+
+    for project_url in find_project_json_urls_in_scripts(&html, &final_url) {
         if let Ok(project) = download_project_json_bytes(project_url, progress) {
             return Ok(project);
         }
@@ -1813,6 +1832,66 @@ fn find_project_json_url_in_html(html: &str, page_url: &tauri::Url) -> Option<ta
     None
 }
 
+fn find_project_json_urls_in_scripts(html: &str, page_url: &tauri::Url) -> Vec<tauri::Url> {
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    for script_url in find_hashed_app_script_urls_in_html(html, page_url)
+        .into_iter()
+        .chain(find_script_urls_in_html(html, page_url))
+    {
+        let response = match reqwest::blocking::get(script_url) {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        let script = match response.text() {
+            Ok(script) => script,
+            Err(_) => continue,
+        };
+
+        for project_url in find_project_json_urls_in_text(&script, page_url) {
+            let key = project_url.as_str().to_ascii_lowercase();
+            if seen.insert(key) {
+                urls.push(project_url);
+            }
+        }
+    }
+
+    urls
+}
+
+fn find_project_json_urls_in_text(text: &str, page_url: &tauri::Url) -> Vec<tauri::Url> {
+    let json_token_regex = Regex::new(
+        r#"(?i)["'`](?P<url>(?:(?:https?:)?//|/|\.{1,2}/)?[^"'`\s]+?\.json(?:\?[^"'`\s]*)?)["'`]"#,
+    )
+    .expect("valid project json token regex");
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+
+    for captures in json_token_regex.captures_iter(text) {
+        let Some(raw) = captures.name("url") else {
+            continue;
+        };
+
+        let cleaned = clean_url_token(raw.as_str());
+        let Some(url) = parse_project_json_candidate(&cleaned, page_url) else {
+            continue;
+        };
+
+        let key = url.as_str().to_ascii_lowercase();
+        if seen.insert(key) {
+            urls.push(url);
+        }
+    }
+
+    urls
+}
+
 fn find_itch_io_iframe_url_in_html(html: &str, page_url: &tauri::Url) -> Option<tauri::Url> {
     let lower_html = html.to_ascii_lowercase();
     let mut cursor = 0;
@@ -2289,6 +2368,7 @@ fn add_project_from_path(
         file_path,
         viewer_preference,
         favorite: false,
+        exclude_from_perk_index: false,
         date_added: Utc::now().to_rfc3339(),
         tags: Vec::new(),
         file_missing: false,
@@ -2506,6 +2586,9 @@ pub fn update_project(
     }
     if let Some(favorite) = patch.favorite {
         updated.favorite = favorite;
+    }
+    if let Some(exclude_from_perk_index) = patch.exclude_from_perk_index {
+        updated.exclude_from_perk_index = exclude_from_perk_index;
     }
     if let Some(tags) = patch.tags {
         updated.tags = tags;
@@ -3258,7 +3341,24 @@ fn extract_project_images_to_folder(project_file_path: &str, bytes: &[u8]) -> Re
         .unwrap_or("project")
         .to_string();
 
-    let project_folder = unique_dir_path(source_dir.join(format!("{}-separate", stem)));
+    let is_folder_project = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("project.json"))
+        .unwrap_or(false);
+
+    let project_folder = if is_folder_project {
+        let source_root = source_dir;
+        let destination_parent = source_root.parent().unwrap_or(source_root);
+        let folder_name = source_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("project");
+        unique_dir_path(destination_parent.join(format!("{}-separate", folder_name)))
+    } else {
+        unique_dir_path(source_dir.join(format!("{}-separate", stem)))
+    };
+
     std::fs::create_dir_all(&project_folder)
         .map_err(|e| format!("Failed to create project folder: {}", e))?;
 
@@ -3347,7 +3447,10 @@ fn copy_existing_project_assets(source_project_path: &Path, destination_dir: &Pa
         .parent()
         .ok_or_else(|| "Project path has no parent directory".to_string())?;
 
-    for entry in walkdir::WalkDir::new(source_root) {
+    for entry in walkdir::WalkDir::new(source_root)
+        .into_iter()
+        .filter_entry(|entry| !entry.path().starts_with(destination_dir))
+    {
         let entry = entry.map_err(|error| format!("Failed to read project folder: {}", error))?;
         let entry_path = entry.path();
         if entry_path == source_project_path {
@@ -3562,25 +3665,45 @@ fn collect_embedded_html_image_refs(
 ) -> Vec<EmbeddedHtmlImageRef> {
     let mut refs = HashSet::new();
     let mut collected = Vec::new();
-    collect_embedded_html_image_refs_inner(value, base_url, &mut refs, &mut collected);
+    let base_dir_segments = url_directory_segments(base_url);
+    collect_embedded_html_image_refs_inner(
+        value,
+        base_url,
+        &base_dir_segments,
+        &mut refs,
+        &mut collected,
+    );
     collected
 }
 
 fn collect_embedded_html_image_refs_inner(
     value: &serde_json::Value,
     base_url: &tauri::Url,
+    base_dir_segments: &[String],
     refs: &mut HashSet<String>,
     collected: &mut Vec<EmbeddedHtmlImageRef>,
 ) {
     match value {
         serde_json::Value::Object(map) => {
             for child in map.values() {
-                collect_embedded_html_image_refs_inner(child, base_url, refs, collected);
+                collect_embedded_html_image_refs_inner(
+                    child,
+                    base_url,
+                    base_dir_segments,
+                    refs,
+                    collected,
+                );
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_embedded_html_image_refs_inner(item, base_url, refs, collected);
+                collect_embedded_html_image_refs_inner(
+                    item,
+                    base_url,
+                    base_dir_segments,
+                    refs,
+                    collected,
+                );
             }
         }
         serde_json::Value::String(text) => {
@@ -3590,6 +3713,7 @@ fn collect_embedded_html_image_refs_inner(
                         collected.push(EmbeddedHtmlImageRef {
                             raw_src: src,
                             resolved_url: url,
+                            base_dir_segments: base_dir_segments.to_vec(),
                         });
                     }
                 }
@@ -3777,6 +3901,22 @@ fn derive_embedded_asset_relative_path(reference: &EmbeddedHtmlImageRef, mime: &
         return sanitize_relative_asset_path(raw_src.trim_start_matches('/'), mime);
     }
 
+    let raw_segments = normalized_relative_path_segments(raw_src);
+    let redundant_prefix = redundant_relative_prefix_len(&reference.base_dir_segments, &raw_segments);
+    if redundant_prefix > 0 {
+        if redundant_prefix < raw_segments.len() {
+            let corrected_path = sanitize_relative_asset_path(
+                &raw_segments[redundant_prefix..].join("/"),
+                mime,
+            );
+            if !corrected_path.is_empty() {
+                return corrected_path;
+            }
+        }
+
+        return sanitized_url_path(&reference.resolved_url, mime);
+    }
+
     let exact_path = sanitize_relative_asset_path(raw_src, mime);
     if !exact_path.is_empty() && !exact_path.starts_with("../") {
         return exact_path;
@@ -3788,6 +3928,58 @@ fn derive_embedded_asset_relative_path(reference: &EmbeddedHtmlImageRef, mime: &
 fn sanitized_url_path(url: &tauri::Url, mime: &str) -> String {
     let path = url.path().trim_matches('/');
     sanitize_relative_asset_path(path, mime)
+}
+
+fn url_directory_segments(url: &tauri::Url) -> Vec<String> {
+    let mut segments = url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| segment.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !url.path().ends_with('/') {
+        segments.pop();
+    }
+
+    segments
+}
+
+fn normalized_relative_path_segments(raw_path: &str) -> Vec<String> {
+    raw_path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .replace('\\', "/")
+        .split('/')
+        .filter_map(|segment| {
+            let trimmed = segment.trim();
+            if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect()
+}
+
+fn redundant_relative_prefix_len(base_dir_segments: &[String], raw_segments: &[String]) -> usize {
+    let max_overlap = base_dir_segments.len().min(raw_segments.len());
+    for overlap in (1..=max_overlap).rev() {
+        let base_suffix = &base_dir_segments[base_dir_segments.len() - overlap..];
+        if base_suffix
+            .iter()
+            .zip(raw_segments.iter())
+            .all(|(base, raw)| base.eq_ignore_ascii_case(raw))
+        {
+            return overlap;
+        }
+    }
+
+    0
 }
 
 fn sanitize_relative_asset_path(raw_path: &str, mime: &str) -> String {

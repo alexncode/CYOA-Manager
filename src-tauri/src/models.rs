@@ -14,6 +14,8 @@ pub struct Project {
     pub viewer_preference: Option<String>,
     #[serde(default)]
     pub favorite: bool,
+    #[serde(default)]
+    pub exclude_from_perk_index: bool,
     pub date_added: String,
     pub tags: Vec<String>,
     #[serde(default)]
@@ -45,6 +47,7 @@ pub struct ProjectPatch {
     pub source_url: Option<String>,
     pub viewer_preference: Option<String>,
     pub favorite: Option<bool>,
+    pub exclude_from_perk_index: Option<bool>,
     pub tags: Option<Vec<String>>,
     /// Re-link a broken card to a new path
     pub file_path: Option<String>,
