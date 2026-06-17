@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { RouterView, RouterLink } from "vue-router";
 import { useSettings } from "./composables/useSettings";
 import { useLibrary } from "./composables/useLibrary";
 import { resolveViewerId } from "./viewers";
 
+const GITHUB_RELEASES_LATEST_URL = "https://api.github.com/repos/alexncode/CYOA-Manager/releases/latest";
+
 const { settings, applyTheme } = useSettings();
 const { projects, viewers, loadLibrary, loadViewers, openViewer } = useLibrary();
+const latestReleaseVersion = ref("");
+const latestReleaseUrl = ref("");
 
 const randomCandidates = computed(() =>
   projects.value.filter((project) => !project.file_missing)
@@ -16,9 +20,20 @@ const canOpenRandom = computed(
   () => randomCandidates.value.length > 0 && viewers.value.length > 0
 );
 
+const updateReleaseUrl = computed(() => {
+  if (!latestReleaseUrl.value || !latestReleaseVersion.value) {
+    return "";
+  }
+
+  return compareReleaseVersions(latestReleaseVersion.value, __APP_VERSION__) > 0
+    ? latestReleaseUrl.value
+    : "";
+});
+
 onMounted(async () => {
   applyTheme();
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  void checkForAppUpdate();
   await loadLibrary();
   await loadViewers();
 });
@@ -41,6 +56,62 @@ async function openRandomProject() {
   }
 
   await openViewer(project, viewerId);
+}
+
+async function checkForAppUpdate() {
+  try {
+    const response = await fetch(GITHUB_RELEASES_LATEST_URL, {
+      headers: {
+        Accept: "application/vnd.github+json",
+      },
+    });
+
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json() as { tag_name?: string; html_url?: string };
+    const version = normalizeReleaseVersion(payload.tag_name);
+    if (!version || !payload.html_url) {
+      return;
+    }
+
+    latestReleaseVersion.value = version;
+    latestReleaseUrl.value = payload.html_url;
+  } catch {
+    latestReleaseVersion.value = "";
+    latestReleaseUrl.value = "";
+  }
+}
+
+function normalizeReleaseVersion(version: string | undefined): string {
+  return (version || "").trim().replace(/^v/i, "");
+}
+
+function compareReleaseVersions(left: string, right: string): number {
+  const leftParts = splitReleaseVersion(left);
+  const rightParts = splitReleaseVersion(right);
+  const maxLength = Math.max(leftParts.length, rightParts.length);
+
+  for (let index = 0; index < maxLength; index += 1) {
+    const leftPart = leftParts[index] || 0;
+    const rightPart = rightParts[index] || 0;
+
+    if (leftPart !== rightPart) {
+      return leftPart - rightPart;
+    }
+  }
+
+  return 0;
+}
+
+function splitReleaseVersion(version: string): number[] {
+  return normalizeReleaseVersion(version)
+    .split(".")
+    .map((part) => {
+      const match = part.match(/^\d+/);
+      return match ? Number(match[0]) : 0;
+    });
 }
 </script>
 
@@ -78,6 +149,15 @@ async function openRandomProject() {
         rel="noreferrer"
       >
         SUPPORT ON PATREON
+      </a>
+      <a
+        v-if="updateReleaseUrl"
+        class="nav-link update-link"
+        :href="updateReleaseUrl"
+        target="_blank"
+        rel="noreferrer"
+      >
+        UPDATE AVAILABLE ({{ latestReleaseVersion }})
       </a>
     </nav>
     <main class="main">
@@ -274,5 +354,12 @@ body {
   font-weight: 600;
   margin: 0px 10px ;
   font-size: 11px;
+}
+
+.update-link {
+  margin: 8px 10px 0;
+  font-size: 11px;
+  color: var(--accent);
+  justify-content: center;
 }
 </style>

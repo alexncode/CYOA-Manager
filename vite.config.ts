@@ -3,10 +3,15 @@ import vue from "@vitejs/plugin-vue";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+// @ts-expect-error process is a nodejs global
+const appVersion = process.env.npm_package_version || "0.0.0";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [vue()],
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
