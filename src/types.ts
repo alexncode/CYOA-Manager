@@ -61,6 +61,7 @@ export interface CatalogEntry {
   date: string;
   website: string;
   link: string;
+  engine?: string;
   author?: string;
   universe?: string;
   importer?: string;

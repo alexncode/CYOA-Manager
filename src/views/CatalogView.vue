@@ -119,27 +119,10 @@ const displayedList = computed(() => {
     hostLabel: extractHostLabel(entry.website),
     existingProjectId: existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null,
   }));
-  const query = search.value.trim().toLowerCase();
+  const tokens = parseCatalogSearchTokens(search.value);
 
-  if (query) {
-    list = list.filter((entry) => {
-      return [
-        entry.name,
-        entry.website,
-        entry.date,
-        entry.author,
-        entry.universe,
-        entry.importer,
-        entry.type,
-        entry.pov,
-        entry.length,
-        entry.description,
-        entry.hostLabel,
-        ...(entry.tags || []),
-      ]
-        .filter((value): value is string => Boolean(value))
-        .some((value) => value.toLowerCase().includes(query));
-    });
+  if (tokens.length > 0) {
+    list = list.filter((entry) => matchesCatalogSearch(entry, tokens));
   }
 
   if (authorFilter.value) {
@@ -247,7 +230,7 @@ async function loadCatalog() {
 }
 
 async function addEntry(entry: CatalogEntry) {
-  if (batchDownloadInProgress.value) {
+  if (batchDownloadInProgress.value || !canAddCatalogEntry(entry)) {
     return;
   }
 
@@ -262,12 +245,12 @@ async function downloadSelectedEntries() {
     return;
   }
 
-  const queue = displayedList.value.filter((entry) => selectedCatalogKeySet.value.has(entry.catalogKey));
+  const queue = displayedList.value.filter((entry) => selectedCatalogKeySet.value.has(entry.catalogKey) && canAddCatalogEntry(entry));
   if (queue.length === 0) {
     batchDownloadCompleted.value = 0;
     batchDownloadTotal.value = 0;
     batchDownloadFailed.value = 0;
-    batchDownloadMessage.value = "";
+    batchDownloadMessage.value = "Only ICC and ICC2 catalog entries can be added to the library.";
     return;
   }
 
@@ -735,6 +718,7 @@ function mapGoogleSheetRowsToCatalogEntries(rows: string[][], zipFallbacks: Map<
       date: date || "",
       website,
       link: archiveMatch?.link || "",
+      engine: readGoogleSheetCell(row, columns, "Engine"),
       author: readGoogleSheetCell(row, columns, "Author"),
       universe: readGoogleSheetCell(row, columns, "Universe"),
       importer: readGoogleSheetCell(row, columns, "Importer"),
@@ -812,6 +796,70 @@ function compareCatalogDates(left: string, right: string): number {
   return left.localeCompare(right);
 }
 
+type CatalogSearchToken = {
+  value: string;
+  excluded: boolean;
+};
+
+function parseCatalogSearchTokens(raw: string): CatalogSearchToken[] {
+  return raw
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const excluded = part.startsWith("-");
+      const value = excluded ? part.slice(1).trim() : part;
+      return {
+        value,
+        excluded,
+      };
+    })
+    .filter((token) => token.value.length > 0);
+}
+
+function buildCatalogSearchHaystack(entry: CatalogListEntry): string[] {
+  return [
+    entry.name,
+    entry.website,
+    entry.date,
+    entry.author,
+    entry.universe,
+    entry.importer,
+    entry.type,
+    entry.pov,
+    entry.length,
+    entry.description,
+    entry.hostLabel,
+    ...(entry.tags || []),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.toLowerCase());
+}
+
+function matchesCatalogSearch(entry: CatalogListEntry, tokens: CatalogSearchToken[]): boolean {
+  const haystack = buildCatalogSearchHaystack(entry);
+
+  return tokens.every((token) => {
+    const matched = haystack.some((value) => value.includes(token.value));
+    return token.excluded ? !matched : matched;
+  });
+}
+
+function normalizeCatalogEngine(engine: unknown): string {
+  if (typeof engine !== "string") {
+    return "";
+  }
+
+  return engine.trim().toUpperCase();
+}
+
+function canAddCatalogEntry(entry: CatalogEntry): boolean {
+  const engine = normalizeCatalogEngine(entry.engine);
+  return engine === "ICC" || engine === "ICC2";
+}
+
 function combineCatalogTags(...groups: string[]): string[] {
   const seen = new Set<string>();
 
@@ -869,7 +917,8 @@ function isCatalogEntry(value: unknown): value is CatalogEntry {
   return typeof candidate.name === "string"
     && typeof candidate.date === "string"
     && typeof candidate.website === "string"
-    && typeof candidate.link === "string";
+    && typeof candidate.link === "string"
+    && (candidate.engine === undefined || typeof candidate.engine === "string");
 }
 
 async function copyWebsiteLink(entry: CatalogEntry) {
@@ -924,7 +973,7 @@ function getTypeBadgeClass(type: string | undefined): string {
         v-model="search"
         class="search"
         type="text"
-        placeholder="Name, author, universe, tags, description…"
+        placeholder="Search terms, use -word to exclude…"
       />
 
       <select v-model="sort" class="filter-select" title="Sort">
@@ -1077,10 +1126,11 @@ function getTypeBadgeClass(type: string | undefined): string {
             <button class="btn-secondary" @click.stop="copyWebsiteLink(entry)">Copy Link</button>
             <button
               :class="entry.existingProjectId ? 'btn-overwrite' : 'btn-primary'"
-              :disabled="addingLink !== null || batchDownloadInProgress"
+              :disabled="addingLink !== null || batchDownloadInProgress || !canAddCatalogEntry(entry)"
+              :title="canAddCatalogEntry(entry) ? undefined : 'Only ICC and ICC2 entries can be added to the library'"
               @click.stop="addEntry(entry)"
             >
-              {{ addingLink === entry.catalogKey ? (entry.existingProjectId ? "Overwriting…" : "Adding…") : (entry.existingProjectId ? "Overwrite" : "Add to Library") }}
+              {{ addingLink === entry.catalogKey ? (entry.existingProjectId ? "Overwriting…" : "Adding…") : (entry.existingProjectId ? "Overwrite" : canAddCatalogEntry(entry) ? "Add to Library" : "Not an ICC/ICC2") }}
             </button>
           </div>
         </div>

@@ -57,15 +57,16 @@ type CatalogProgressPayload = {
   error?: string | null;
 };
 
+type LibrarySearchToken = {
+  value: string;
+  excluded: boolean;
+};
+
 const displayedList = computed(() => {
   let list = [...projects.value];
-  const q = search.value.toLowerCase().trim();
-  if (q) {
-    list = list.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.tags.some((t) => t.toLowerCase().includes(q))
-    );
+  const tokens = parseLibrarySearchTokens(search.value);
+  if (tokens.length > 0) {
+    list = list.filter((project) => matchesLibrarySearch(project, tokens));
   }
   if (tagFilter.value) {
     list = list.filter((p) => p.tags.includes(tagFilter.value));
@@ -86,6 +87,39 @@ const displayedList = computed(() => {
   }
   return list;
 });
+
+function parseLibrarySearchTokens(raw: string): LibrarySearchToken[] {
+  return raw
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const excluded = part.startsWith("-");
+      const value = excluded ? part.slice(1).trim() : part;
+      return {
+        value,
+        excluded,
+      };
+    })
+    .filter((token) => token.value.length > 0);
+}
+
+function buildLibrarySearchHaystack(project: Project): string[] {
+  return [project.name, ...project.tags]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.toLowerCase());
+}
+
+function matchesLibrarySearch(project: Project, tokens: LibrarySearchToken[]): boolean {
+  const haystack = buildLibrarySearchHaystack(project);
+
+  return tokens.every((token) => {
+    const matched = haystack.some((value) => value.includes(token.value));
+    return token.excluded ? !matched : matched;
+  });
+}
 
 onMounted(async () => {
   await loadLibrary();
@@ -238,7 +272,7 @@ async function onRedownload(project: Project) {
         v-model="search"
         class="search"
         type="text"
-        placeholder="Search projects…"
+        placeholder="Search projects, use -word to exclude…"
       />
 
       <select v-model="tagFilter" class="filter-select" title="Filter by tag">
