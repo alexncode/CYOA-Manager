@@ -53,6 +53,11 @@ const sourceUrl = computed(() => {
   return raw && raw.trim() ? raw : null;
 });
 
+const redownloadUrl = computed(() => {
+  const raw = props.project.project_json_url || props.project.source_url;
+  return raw && raw.trim() ? raw : null;
+});
+
 const isRedownloading = computed(() => redownloading.value || Boolean(props.redownloadBusy));
 const redownloadText = computed(() => {
   if (!isRedownloading.value) {
@@ -133,7 +138,7 @@ async function onOpenSource() {
 }
 
 async function onRedownload() {
-  if (!sourceUrl.value || isRedownloading.value) {
+  if (!redownloadUrl.value || isRedownloading.value) {
     return;
   }
 
@@ -163,8 +168,9 @@ async function onRedownload() {
       />
       <span v-else class="initials">{{ initials }}</span>
 
-      <div v-if="sourceUrl" class="source-actions">
+      <div v-if="sourceUrl || redownloadUrl" class="source-actions">
         <button
+          v-if="sourceUrl"
           class="source-btn"
           :disabled="openingSource || isRedownloading"
           @click.stop="onOpenSource"

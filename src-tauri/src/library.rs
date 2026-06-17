@@ -113,13 +113,14 @@ pub fn update_project(project: &Project) -> Result<(), String> {
                 description = ?2,
                 cover_image = ?3,
                 source_url = ?4,
-                file_path = ?5,
-                viewer_preference = ?6,
-                favorite = ?7,
-                exclude_from_perk_index = ?8,
-                date_added = ?9,
-                tags_json = ?10
-            WHERE id = ?11
+                project_json_url = ?5,
+                file_path = ?6,
+                viewer_preference = ?7,
+                favorite = ?8,
+                exclude_from_perk_index = ?9,
+                date_added = ?10,
+                tags_json = ?11
+            WHERE id = ?12
             ",
             project_row_params(project),
         )
@@ -146,13 +147,14 @@ pub fn update_projects(projects: &[Project]) -> Result<(), String> {
                     description = ?2,
                     cover_image = ?3,
                     source_url = ?4,
-                    file_path = ?5,
-                    viewer_preference = ?6,
-                    favorite = ?7,
-                    exclude_from_perk_index = ?8,
-                    date_added = ?9,
-                    tags_json = ?10
-                WHERE id = ?11
+                    project_json_url = ?5,
+                    file_path = ?6,
+                    viewer_preference = ?7,
+                    favorite = ?8,
+                    exclude_from_perk_index = ?9,
+                    date_added = ?10,
+                    tags_json = ?11
+                WHERE id = ?12
                 ",
                 project_row_params(project),
             )
@@ -226,12 +228,13 @@ pub fn reload_library() -> Result<Library, String> {
     load_library().map(|result| result.library)
 }
 
-fn project_row_params(project: &Project) -> [rusqlite::types::Value; 11] {
+fn project_row_params(project: &Project) -> [rusqlite::types::Value; 12] {
     [
         project.name.clone().into(),
         project.description.clone().into(),
         project.cover_image.clone().into(),
         project.source_url.clone().into(),
+        project.project_json_url.clone().into(),
         project.file_path.clone().into(),
         project.viewer_preference.clone().into(),
         (project.favorite as i64).into(),
@@ -247,13 +250,14 @@ fn upsert_project(conn: &Connection, project: &Project) -> Result<(), String> {
     conn.execute(
         "
         INSERT INTO library_projects (
-            id, name, description, cover_image, source_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            id, name, description, cover_image, source_url, project_json_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
             cover_image = excluded.cover_image,
             source_url = excluded.source_url,
+            project_json_url = excluded.project_json_url,
             file_path = excluded.file_path,
             viewer_preference = excluded.viewer_preference,
             favorite = excluded.favorite,
@@ -267,6 +271,7 @@ fn upsert_project(conn: &Connection, project: &Project) -> Result<(), String> {
             project.description,
             project.cover_image,
             project.source_url,
+            project.project_json_url,
             project.file_path,
             project.viewer_preference,
             project.favorite as i64,
@@ -302,6 +307,7 @@ fn initialize_library_schema(conn: &Connection) -> Result<(), String> {
             description TEXT NOT NULL,
             cover_image TEXT,
             source_url TEXT,
+            project_json_url TEXT,
             file_path TEXT NOT NULL,
             viewer_preference TEXT,
             favorite INTEGER NOT NULL DEFAULT 0,
@@ -315,6 +321,7 @@ fn initialize_library_schema(conn: &Connection) -> Result<(), String> {
 
     let mut has_favorite = false;
     let mut has_exclude_from_perk_index = false;
+    let mut has_project_json_url = false;
     let mut statement = conn
         .prepare("PRAGMA table_info(library_projects)")
         .map_err(|e| e.to_string())?;
@@ -325,8 +332,17 @@ fn initialize_library_schema(conn: &Connection) -> Result<(), String> {
         match column.map_err(|e| e.to_string())?.as_str() {
             "favorite" => has_favorite = true,
             "exclude_from_perk_index" => has_exclude_from_perk_index = true,
+            "project_json_url" => has_project_json_url = true,
             _ => {}
         }
+    }
+
+    if !has_project_json_url {
+        conn.execute(
+            "ALTER TABLE library_projects ADD COLUMN project_json_url TEXT",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     if !has_favorite {
@@ -363,7 +379,7 @@ fn read_library_from_db(conn: &Connection) -> Result<Library, String> {
     let mut statement = conn
         .prepare(
             "
-            SELECT id, name, description, cover_image, source_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
+            SELECT id, name, description, cover_image, source_url, project_json_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
             FROM library_projects
             ORDER BY date_added DESC, name COLLATE NOCASE ASC
             ",
@@ -372,7 +388,7 @@ fn read_library_from_db(conn: &Connection) -> Result<Library, String> {
 
     let rows = statement
         .query_map([], |row| {
-            let tags_json: String = row.get(10)?;
+            let tags_json: String = row.get(11)?;
             let tags = serde_json::from_str(&tags_json).unwrap_or_default();
 
             Ok(Project {
@@ -381,11 +397,12 @@ fn read_library_from_db(conn: &Connection) -> Result<Library, String> {
                 description: row.get(2)?,
                 cover_image: row.get(3)?,
                 source_url: row.get(4)?,
-                file_path: row.get(5)?,
-                viewer_preference: row.get(6)?,
-                favorite: row.get::<_, i64>(7)? != 0,
-                exclude_from_perk_index: row.get::<_, i64>(8)? != 0,
-                date_added: row.get(9)?,
+                project_json_url: row.get(5)?,
+                file_path: row.get(6)?,
+                viewer_preference: row.get(7)?,
+                favorite: row.get::<_, i64>(8)? != 0,
+                exclude_from_perk_index: row.get::<_, i64>(9)? != 0,
+                date_added: row.get(10)?,
                 tags,
                 file_missing: false,
             })
@@ -410,8 +427,8 @@ fn write_library_to_db(conn: &mut Connection, library: &Library) -> Result<(), S
             .prepare(
                 "
                 INSERT INTO library_projects (
-                    id, name, description, cover_image, source_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    id, name, description, cover_image, source_url, project_json_url, file_path, viewer_preference, favorite, exclude_from_perk_index, date_added, tags_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ",
             )
             .map_err(|e| e.to_string())?;
@@ -425,6 +442,7 @@ fn write_library_to_db(conn: &mut Connection, library: &Library) -> Result<(), S
                     project.description,
                     project.cover_image,
                     project.source_url,
+                    project.project_json_url,
                     project.file_path,
                     project.viewer_preference,
                     project.favorite as i64,

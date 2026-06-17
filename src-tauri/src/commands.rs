@@ -146,7 +146,7 @@ pub fn take_library_migration_notice(
 
 #[tauri::command]
 pub fn add_project(file_path: String, state: State<LibraryState>) -> Result<Project, String> {
-    add_project_from_path(file_path, &state, None)
+    add_project_from_path(file_path, &state, None, None)
 }
 
 #[tauri::command]
@@ -446,6 +446,7 @@ fn run_download_project(
         destination.to_string_lossy().to_string(),
         &library,
         normalize_source_url(&url),
+        normalize_source_url(base_url.as_str()),
     )?;
     if let Some(viewer_id) = downloaded_viewer_id {
         project = set_project_viewer_preference_after_import(&project.id, &viewer_id, &library)?;
@@ -497,12 +498,12 @@ fn run_download_catalog_entry(
     let library = app.state::<LibraryState>();
     let desired_name = project_name.trim();
 
-    let saved_project_path = match download_catalog_website_project(
+    let (saved_project_path, resolved_source_url) = match download_catalog_website_project(
         Some((app, task_id)),
         website_url.trim(),
         desired_name,
     ) {
-        Ok(path) => path,
+        Ok(result) => result,
         Err(error) => {
             emit_catalog_import_progress(
                 app.clone(),
@@ -518,11 +519,14 @@ fn run_download_catalog_entry(
                 },
             );
 
-            download_catalog_project_zip(
-                zip_url.trim(),
-                desired_name,
-                Some((app, task_id)),
-            )?
+            (
+                download_catalog_project_zip(
+                    zip_url.trim(),
+                    desired_name,
+                    Some((app, task_id)),
+                )?,
+                normalize_source_url(&website_url),
+            )
         }
     };
 
@@ -544,6 +548,7 @@ fn run_download_catalog_entry(
         saved_project_path.to_string_lossy().to_string(),
         &library,
         normalize_source_url(&website_url),
+        resolved_source_url,
     )?;
 
     apply_catalog_project_name_override(&mut project, desired_name, &library)?;
@@ -595,13 +600,13 @@ fn run_overwrite_catalog_entry(
     let desired_name = project_name.trim();
     let overwrite_destination = existing_project_file_path(project_id, &library);
 
-    let saved_project_path = match download_catalog_website_project_to_destination(
+    let (saved_project_path, resolved_source_url) = match download_catalog_website_project_to_destination(
         Some((app, task_id)),
         website_url.trim(),
         desired_name,
         overwrite_destination.as_deref(),
     ) {
-        Ok(path) => path,
+        Ok(result) => result,
         Err(error) => {
             emit_catalog_import_progress(
                 app.clone(),
@@ -617,11 +622,14 @@ fn run_overwrite_catalog_entry(
                 },
             );
 
-            download_catalog_project_zip(
-                zip_url.trim(),
-                desired_name,
-                Some((app, task_id)),
-            )?
+            (
+                download_catalog_project_zip(
+                    zip_url.trim(),
+                    desired_name,
+                    Some((app, task_id)),
+                )?,
+                normalize_source_url(&website_url),
+            )
         }
     };
 
@@ -644,6 +652,7 @@ fn run_overwrite_catalog_entry(
         saved_project_path.to_string_lossy().to_string(),
         &library,
         normalize_source_url(&website_url),
+        resolved_source_url,
         desired_name,
     )?;
 
@@ -671,7 +680,7 @@ fn download_catalog_website_project(
     progress: Option<(&tauri::AppHandle, &str)>,
     website_url: &str,
     project_name: &str,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<String>), String> {
     download_catalog_website_project_to_destination(progress, website_url, project_name, None)
 }
 
@@ -680,7 +689,7 @@ fn download_catalog_website_project_to_destination(
     website_url: &str,
     project_name: &str,
     destination_override: Option<&Path>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<String>), String> {
     let trimmed_url = website_url.trim();
     if trimmed_url.is_empty() {
         return Err("Missing website URL".to_string());
@@ -772,7 +781,7 @@ fn download_catalog_website_project_to_destination(
 
     let destination = save_processed_downloaded_project(&dir, &base_url, destination_override, processed)?;
 
-    Ok(destination)
+    Ok((destination, normalize_source_url(base_url.as_str())))
 }
 
 fn download_project_data(
@@ -2340,6 +2349,7 @@ fn add_project_from_path(
     file_path: String,
     state: &State<LibraryState>,
     source_url: Option<String>,
+    project_json_url: Option<String>,
 ) -> Result<Project, String> {
     let path = Path::new(&file_path);
     if !path.exists() {
@@ -2365,6 +2375,7 @@ fn add_project_from_path(
         description: String::new(),
         cover_image,
         source_url,
+        project_json_url,
         file_path,
         viewer_preference,
         favorite: false,
@@ -2389,6 +2400,7 @@ fn replace_project_from_path(
     file_path: String,
     state: &State<LibraryState>,
     source_url: Option<String>,
+    project_json_url: Option<String>,
     desired_name: &str,
 ) -> Result<Project, String> {
     let path = Path::new(&file_path);
@@ -2424,6 +2436,7 @@ fn replace_project_from_path(
     };
     updated.cover_image = cover_image;
     updated.source_url = source_url;
+    updated.project_json_url = project_json_url;
     updated.file_path = file_path;
     updated.file_missing = false;
     if updated.viewer_preference.is_none() {
@@ -2475,17 +2488,6 @@ fn normalize_source_url(raw: &str) -> Option<String> {
     }
 
     url.set_fragment(None);
-
-    let last_segment = url
-        .path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
-        .map(|segment| segment.to_ascii_lowercase());
-
-    if matches!(last_segment.as_deref(), Some(segment) if segment.ends_with(".json")) {
-        let mut segments = url.path_segments_mut().ok()?;
-        segments.pop_if_empty();
-        segments.pop();
-    }
 
     if url.path().is_empty() {
         url.set_path("/");
@@ -2579,7 +2581,11 @@ pub fn update_project(
         };
     }
     if let Some(source_url) = patch.source_url {
-        updated.source_url = normalize_source_url(&source_url);
+        let normalized_source_url = normalize_source_url(&source_url);
+        if normalized_source_url != updated.source_url {
+            updated.project_json_url = None;
+        }
+        updated.source_url = normalized_source_url;
     }
     if let Some(vp) = patch.viewer_preference {
         updated.viewer_preference = if vp.is_empty() { None } else { Some(vp) };

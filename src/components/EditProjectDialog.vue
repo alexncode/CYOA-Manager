@@ -21,6 +21,7 @@ const sourceUrl = ref(props.project.source_url ?? "");
 const viewerPreference = ref(props.project.viewer_preference ?? "");
 const excludeFromPerkIndex = ref(props.project.exclude_from_perk_index);
 const coverPreviewError = ref(false);
+const directJsonCopyStatus = ref("");
 
 watch(() => cover.value, () => { coverPreviewError.value = false; });
 watch(() => props.project, (project) => {
@@ -31,6 +32,7 @@ watch(() => props.project, (project) => {
   sourceUrl.value = project.source_url ?? "";
   viewerPreference.value = project.viewer_preference ?? "";
   excludeFromPerkIndex.value = project.exclude_from_perk_index;
+  directJsonCopyStatus.value = "";
 }, { deep: true });
 
 async function pickCover() {
@@ -39,6 +41,28 @@ async function pickCover() {
     filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif", "avif"] }],
   });
   if (selected) cover.value = selected as string;
+}
+
+async function copyDirectJsonUrl() {
+  if (!props.project.project_json_url) {
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(props.project.project_json_url);
+    directJsonCopyStatus.value = "Copied";
+  } catch {
+    directJsonCopyStatus.value = "Copy failed";
+  }
+}
+
+function formatDateAdded(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleString();
 }
 
 function save() {
@@ -102,10 +126,22 @@ function save() {
         <input v-model="sourceUrl" type="text" placeholder="https://... or leave empty" />
       </label>
 
+      <div v-if="project.project_json_url" class="file-path">
+        <strong>Direct JSON:</strong>
+        <button class="direct-link" type="button" @click="copyDirectJsonUrl">
+          {{ project.project_json_url }}
+        </button>
+        <span v-if="directJsonCopyStatus" class="copy-status">{{ directJsonCopyStatus }}</span>
+      </div>
+
       <label class="checkbox-row">
         <input v-model="excludeFromPerkIndex" type="checkbox" />
         <span>Exclude from Perk Index</span>
       </label>
+
+      <div class="file-path">
+        <strong>Date added:</strong> {{ formatDateAdded(project.date_added) }}
+      </div>
 
       <div class="file-path">
         <strong>File:</strong> {{ project.file_path }}
@@ -136,9 +172,11 @@ function save() {
   padding: 28px;
   width: 480px;
   max-width: 95vw;
+  max-height: 95vh;
   display: flex;
   flex-direction: column;
   gap: 14px;
+  overflow-y: auto;
 }
 h2 {
   margin: 0 0 4px;
@@ -201,6 +239,23 @@ label select:focus {
   font-size: 0.75rem;
   color: var(--muted);
   word-break: break-all;
+}
+.direct-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  word-break: break-all;
+}
+.direct-link:hover {
+  text-decoration: underline;
+}
+.copy-status {
+  margin-left: 6px;
+  color: lightgreen;
 }
 .dialog-actions {
   display: flex;

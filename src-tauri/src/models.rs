@@ -10,6 +10,8 @@ pub struct Project {
     pub cover_image: Option<String>,
     #[serde(default)]
     pub source_url: Option<String>,
+    #[serde(default)]
+    pub project_json_url: Option<String>,
     pub file_path: String,
     pub viewer_preference: Option<String>,
     #[serde(default)]

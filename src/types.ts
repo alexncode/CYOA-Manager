@@ -4,6 +4,7 @@ export interface Project {
   description: string;
   cover_image: string | null;
   source_url?: string | null;
+  project_json_url?: string | null;
   file_path: string;
   viewer_preference: string | null;
   favorite: boolean;

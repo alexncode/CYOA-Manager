@@ -201,7 +201,8 @@ async function onToggleFavorite(project: Project) {
 }
 
 async function onRedownload(project: Project) {
-  if (!project.source_url || !project.source_url.trim()) {
+  const redownloadUrl = project.project_json_url?.trim() || project.source_url?.trim() || "";
+  if (!redownloadUrl) {
     return;
   }
 
@@ -248,7 +249,7 @@ async function onRedownload(project: Project) {
     await startOverwriteCatalogEntry(
       taskId,
       project.id,
-      project.source_url,
+      redownloadUrl,
       "",
       project.name,
       settings.value.downloadSizeLimitMb,
