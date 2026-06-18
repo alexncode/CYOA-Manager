@@ -413,8 +413,17 @@ fn index_project(
 ) -> Result<(), String> {
     delete_project_rows(tx, &project.id)?;
 
-    let content = fs::read_to_string(&project.file_path).map_err(|error| error.to_string())?;
-    let json: Value = serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    let json = match load_project_json(project) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!(
+                "Skipping malformed project during perk indexing: {} ({})",
+                project.name, error
+            );
+            mark_project_indexed(tx, project, signature)?;
+            return Ok(());
+        }
+    };
     let perks = extract_perks(&json);
 
     if include_images {
@@ -426,7 +435,16 @@ fn index_project(
 
     for (index, perk) in perks.iter().enumerate() {
         let image_path = if include_images {
-            extract_image(project, perk, index)?
+            match extract_image(project, perk, index) {
+                Ok(image_path) => image_path,
+                Err(error) => {
+                    eprintln!(
+                        "Skipping broken perk image during indexing: {} / {} ({})",
+                        project.name, perk.title, error
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -468,6 +486,14 @@ fn index_project(
         .map_err(|error| error.to_string())?;
     }
 
+    mark_project_indexed(tx, project, signature)
+}
+
+fn mark_project_indexed(
+    tx: &Transaction<'_>,
+    project: &Project,
+    signature: &str,
+) -> Result<(), String> {
     tx.execute(
         "INSERT INTO indexed_projects (project_id, project_name, file_path, file_signature, indexed_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -868,6 +894,15 @@ fn extract_image(project: &Project, perk: &ParsedPerk, index: usize) -> Result<O
     Ok(Some(file_path.to_string_lossy().to_string()))
 }
 
+fn load_project_json(project: &Project) -> Result<Value, String> {
+    let bytes = fs::read(&project.file_path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(strip_utf8_bom(&bytes)).map_err(|error| error.to_string())
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
+
 fn resolve_local_image_path(project: &Project, image_value: &str) -> PathBuf {
     let image_path = Path::new(image_value);
     if image_path.is_absolute() {
@@ -963,4 +998,38 @@ fn sanitize_segment(value: &str) -> String {
 
 fn emit_perk_index_progress(app: AppHandle, payload: PerkIndexProgress) {
     let _ = app.emit("perk-index-progress", payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_perks, strip_utf8_bom};
+    use serde_json::json;
+
+    #[test]
+    fn strip_utf8_bom_removes_prefix_only_when_present() {
+        let payload = b"\xEF\xBB\xBF{\"rows\":[]}";
+        assert_eq!(strip_utf8_bom(payload), b"{\"rows\":[]}");
+        assert_eq!(strip_utf8_bom(b"{\"rows\":[]}"), b"{\"rows\":[]}");
+    }
+
+    #[test]
+    fn extract_perks_uses_object_id_as_fallback_title() {
+        let document = json!({
+            "rows": [
+                {
+                    "id": "row-1",
+                    "title": "Row 1",
+                    "objects": [
+                        { "id": "empty" },
+                        { "id": "perk-1", "title": "Perk 1", "text": "Has text" }
+                    ]
+                }
+            ]
+        });
+
+        let perks = extract_perks(&document);
+        assert_eq!(perks.len(), 2);
+        assert_eq!(perks[0].title, "empty");
+        assert_eq!(perks[1].object_id, "perk-1");
+    }
 }
