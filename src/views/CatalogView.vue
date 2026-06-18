@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { CatalogEntry, OversizeActionStrategy } from "../types";
+import type { CatalogEntry, OversizeActionStrategy, Project } from "../types";
 import { useLibrary } from "../composables/useLibrary";
 import { useSettings } from "../composables/useSettings";
 import ProgressBar from "../components/ProgressBar.vue";
@@ -13,7 +13,7 @@ const GOOGLE_SHEETS_SPREADSHEET_ID = "1jxBbWB08myhD8YXePPifsWQG3JH2qZtBs9Y5yYcqE
 const GOOGLE_SHEETS_SHEET_NAME = "Beta Index";
 const LOCAL_CATALOG_URL = "/zip_link_catalog_data.js";
 
-const { projects, loadLibrary, startDownloadCatalogEntry, startOverwriteCatalogEntry, startApplyOversizeProjectAction } = useLibrary();
+const { projects, loadLibrary, startDownloadCatalogEntry, startOverwriteCatalogEntry, startApplyOversizeProjectAction, setProjectFavorite } = useLibrary();
 const { settings } = useSettings();
 
 const entries = ref<CatalogEntry[]>([]);
@@ -29,6 +29,7 @@ const typeFilter = ref("");
 const povFilter = ref("");
 const lengthFilter = ref("");
 const tagFilter = ref("");
+const favoriteFilter = ref<"all" | "favorites">("all");
 const successMessage = ref<string | null>(null);
 const addStatus = ref("");
 const addProgress = ref(0);
@@ -93,6 +94,7 @@ type CatalogListEntry = CatalogEntry & {
   catalogKey: string;
   hostLabel: string | null;
   existingProjectId: string | null;
+  existingProjectFavorite: boolean;
 };
 
 type GoogleSheetResponse = {
@@ -100,12 +102,12 @@ type GoogleSheetResponse = {
 };
 
 const existingCatalogProjectByWebsite = computed(() => {
-  const map = new Map<string, string>();
+  const map = new Map<string, Project>();
 
   for (const project of projects.value) {
     const normalizedSourceUrl = normalizeLibrarySourceUrl(project.source_url || "");
     if (normalizedSourceUrl && !map.has(normalizedSourceUrl)) {
-      map.set(normalizedSourceUrl, project.id);
+      map.set(normalizedSourceUrl, project);
     }
   }
 
@@ -113,12 +115,17 @@ const existingCatalogProjectByWebsite = computed(() => {
 });
 
 const displayedList = computed(() => {
-  let list: CatalogListEntry[] = entries.value.map((entry) => ({
-    ...entry,
-    catalogKey: buildCatalogKey(entry),
-    hostLabel: extractHostLabel(entry.website),
-    existingProjectId: existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null,
-  }));
+  let list: CatalogListEntry[] = entries.value.map((entry) => {
+    const existingProject = existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null;
+
+    return {
+      ...entry,
+      catalogKey: buildCatalogKey(entry),
+      hostLabel: extractHostLabel(entry.website),
+      existingProjectId: existingProject?.id || null,
+      existingProjectFavorite: existingProject?.favorite ?? false,
+    };
+  });
   const tokens = parseCatalogSearchTokens(search.value);
 
   if (tokens.length > 0) {
@@ -151,6 +158,10 @@ const displayedList = computed(() => {
 
   if (tagFilter.value) {
     list = list.filter((entry) => entry.tags?.includes(tagFilter.value));
+  }
+
+  if (favoriteFilter.value === "favorites") {
+    list = list.filter((entry) => entry.existingProjectFavorite);
   }
 
   if (sort.value === "name") {
@@ -238,6 +249,14 @@ async function addEntry(entry: CatalogEntry) {
   if (success) {
     removeSelectedCatalogKey(buildCatalogKey(entry));
   }
+}
+
+async function toggleCatalogFavorite(entry: CatalogListEntry) {
+  if (!entry.existingProjectId) {
+    return;
+  }
+
+  await setProjectFavorite(entry.existingProjectId, !entry.existingProjectFavorite);
 }
 
 async function downloadSelectedEntries() {
@@ -940,7 +959,7 @@ async function openCatalogWebsite(entry: CatalogEntry) {
 }
 
 function getExistingCatalogProjectId(entry: CatalogEntry): string | null {
-  return existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website)) || null;
+  return existingCatalogProjectByWebsite.value.get(normalizeLibrarySourceUrl(entry.website))?.id || null;
 }
 
 function extractHostLabel(website: string): string | null {
@@ -1022,6 +1041,11 @@ function getTypeBadgeClass(type: string | undefined): string {
     </div>
 
     <div class="filter-row">
+      <select v-model="favoriteFilter" style="max-width: 100px;" class="filter-select">
+        <option value="all">All ♥♡ </option>
+        <option value="favorites">Only Favorites ♥</option>
+      </select>
+
       <select v-model="authorFilter" class="filter-select">
         <option value="">All authors</option>
         <option v-for="option in authorOptions" :key="option" :value="option">{{ option }}</option>
@@ -1047,12 +1071,12 @@ function getTypeBadgeClass(type: string | undefined): string {
         <option v-for="option in povOptions" :key="option" :value="option">{{ option }}</option>
       </select>
 
-      <select v-model="lengthFilter" class="filter-select">
+      <select v-model="lengthFilter" style="max-width: 100px;" class="filter-select">
         <option value="">All lengths</option>
         <option v-for="option in lengthOptions" :key="option" :value="option">{{ option }}</option>
       </select>
 
-      <select v-model="tagFilter" class="filter-select">
+      <select v-model="tagFilter" style="max-width: 100px;" class="filter-select">
         <option value="">All tags</option>
         <option v-for="option in tagOptions" :key="option" :value="option">{{ option }}</option>
       </select>
@@ -1124,6 +1148,15 @@ function getTypeBadgeClass(type: string | undefined): string {
               Open Site
             </button>
             <button class="btn-secondary" @click.stop="copyWebsiteLink(entry)">Copy Link</button>
+            <button
+              v-if="entry.existingProjectId"
+              class="favorite-action-btn"
+              :class="{ active: entry.existingProjectFavorite }"
+              :title="entry.existingProjectFavorite ? 'Remove favorite' : 'Add favorite'"
+              @click.stop="toggleCatalogFavorite(entry)"
+            >
+              {{ entry.existingProjectFavorite ? "♥" : "♡" }}
+            </button>
             <button
               :class="entry.existingProjectId ? 'btn-overwrite' : 'btn-primary'"
               :disabled="addingLink !== null || batchDownloadInProgress || !canAddCatalogEntry(entry)"
@@ -1581,6 +1614,34 @@ function getTypeBadgeClass(type: string | undefined): string {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+
+.favorite-action-btn {
+  flex: 0 0 48px;
+  min-width: 48px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 1rem;
+  line-height: 1;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s;
+}
+
+.favorite-action-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+}
+
+.favorite-action-btn.active {
+  background: rgba(255, 122, 143, 0.14);
+  border-color: rgba(255, 122, 143, 0.35);
+  color: #ff7a8f;
 }
 
 .btn-overwrite {
